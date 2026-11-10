@@ -1,4 +1,5 @@
 import asyncio
+import os
 import logging
 from multiprocessing import Process
 
@@ -7,6 +8,7 @@ import uvicorn
 from gpustack.config.config import Config
 from gpustack.schemas.config import GatewayModeEnum
 from gpustack.server.app import create_app
+from gpustack.server.init_db import init_db
 
 logger = logging.getLogger(__name__)
 
@@ -24,10 +26,17 @@ class Server:
 
         self._async_tasks.append(asyncio.create_task(coro))
 
+    @property
+    def config(self):
+        return self._config
+
     async def start(self):
         logger.info("Starting GPUStack server.")
 
+        await self._prepare_data()
+
         app = create_app(self._config)
+        self._app = app
 
         # 内嵌网关模式下，API 只监听本机，由网关对外；其他模式直接监听所有网卡
         serving_host = (
@@ -52,3 +61,15 @@ class Server:
         self._create_async_task(server.serve())
 
         await asyncio.gather(*self._async_tasks)
+
+    async def _prepare_data(self):
+        self._setup_data_dir(self._config.data_dir)
+
+        await init_db(self._config.get_database_url())
+
+        logger.debug("Data initialization completed.")
+
+    @staticmethod
+    def _setup_data_dir(data_dir: str):
+        if not os.path.exists(data_dir):
+            os.makedirs(data_dir)

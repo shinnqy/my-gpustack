@@ -32,6 +32,7 @@ class Config(WorkerConfig, BaseSettings):
     database_url: Optional[str] = None
     disable_worker: Optional[bool] = None  # Deprecated
     enable_worker: bool = False
+    disable_openapi_docs: bool = False
 
     _data_dir_was_fresh = False
 
