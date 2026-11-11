@@ -99,7 +99,14 @@ class WorkerClient:
                         continue
                     # Convert attribute to string for comparison
                     attr_value = getattr(item, key, None)
-                    if attr_value is not None and str(attr_value) != str(value):
+                    if key == "search":
+                        name = str(getattr(item, "name", "")).lower()
+                        matches = str(value).strip().lower() in name
+                    else:
+                        actual = getattr(attr_value, "value", attr_value)
+                        expected = getattr(value, "value", value)
+                        matches = str(actual) == str(expected)
+                    if not matches:
                         match = False
                         break
                 if match:

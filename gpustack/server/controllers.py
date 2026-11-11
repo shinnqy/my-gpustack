@@ -23,6 +23,7 @@ from gpustack.server.bus import (
     resolve_event_id,
 )
 from gpustack.server.db import async_session
+from gpustack.server.cache import delete_cache_by_key
 from gpustack.server.services import (
     ModelInstanceService,
     ModelService,
@@ -94,6 +95,12 @@ class ModelInstanceController:
         model_id = event_field(model_instance, "model_id")
         try:
             async with async_session() as session:
+                if event.type == EventType.DELETED:
+                    service = ModelInstanceService(session)
+                    if instance_id is not None:
+                        await delete_cache_by_key(service.get_by_id, instance_id)
+                    if model_id is not None:
+                        await delete_cache_by_key(service.get_running_instances, model_id)
                 if model_id is None:
                     return
                 model = await Model.one_by_id(session, model_id)

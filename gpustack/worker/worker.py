@@ -26,6 +26,7 @@ from gpustack.utils.network import get_ifname_by_ip_hostname
 from typing import Tuple
 from urllib.parse import urlparse
 from gpustack.utils.uuid import get_worker_name
+from gpustack.worker.serve_manager import ServeManager
 
 
 logger = logging.getLogger(__name__)
@@ -78,7 +79,6 @@ class Worker:
         self._address = "0.0.0.0"
         self._async_tasks = []
         self._worker_ip, self._worker_ifname = self._detect_worker_ip_and_ifname()
-
         self._status_collector = WorkerStatusCollector(
             cfg=cfg,
             worker_ip_getter=self.worker_ip,
@@ -86,11 +86,15 @@ class Worker:
             worker_id_getter=self.worker_id,
             worker_uuid_getter=self.worker_uuid,
         )
-
         self._worker_manager = WorkerManager(
             cfg=cfg,
             is_embedded=self._is_embedded,
             collector=self._status_collector,
+        )
+        self._serve_manager = ServeManager(
+            worker_id_getter=self.worker_id,
+            clientset_getter=self.clientset,
+            cfg=self._config,
         )
 
     @tenacity.retry(
@@ -139,28 +143,18 @@ class Worker:
         """
         Start the worker.
         """
-
         logger.info("Starting GPUStack worker.")
-
         add_signal_handlers_in_loop()
-
         await self._register()
-
-        # Send heartbeat to the server every WORKER_HEARTBEAT_INTERVAL seconds.
         run_periodically_in_thread(self._heartbeat, envs.WORKER_HEARTBEAT_INTERVAL)
-
-        # Report the worker node status to the server every WORKER_STATUS_SYNC_INTERVAL seconds.
         run_periodically_in_thread(
             self._worker_manager.sync_worker_status, envs.WORKER_STATUS_SYNC_INTERVAL
         )
-
-        # Start the worker server to expose APIs.
         self._create_async_task(self._serve_apis())
-
-        # wait for a while to let other tasks start
+        self._create_async_task(self._serve_manager.watch_models())
+        self._create_async_task(self._serve_manager.watch_model_instances_event())
         await asyncio.sleep(0.5)
         logger.info("GPUStack worker startup completed.")
-
         await asyncio.gather(*self._async_tasks)
 
     async def _serve_apis(self):
@@ -178,9 +172,11 @@ class Worker:
                 connector=connector, trust_env=True
             )
             app.state.http_client_no_proxy = aiohttp.ClientSession(connector=connector)
-            yield
-            await app.state.http_client.close()
-            await app.state.http_client_no_proxy.close()
+            try:
+                yield
+            finally:
+                await app.state.http_client.close()
+                await app.state.http_client_no_proxy.close()
 
         app = FastAPI(
             title="GPUStack Worker",

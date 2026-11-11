@@ -17,6 +17,8 @@ from gpustack.schemas.models import (
 from gpustack.server.db import async_session
 from gpustack.server.deps import SessionDep
 from gpustack.schemas.clusters import Cluster
+from gpustack.server.services import ModelService
+from fastapi.responses import StreamingResponse
 
 
 router = APIRouter()
@@ -24,6 +26,14 @@ router = APIRouter()
 
 @router.get("", response_model=ModelsPublic)
 async def get_models(params: ListParams = Depends()):
+    fields = {}
+    fuzzy_fields = {}
+    if params.watch:
+        return StreamingResponse(
+            Model.streaming(fields=fields, fuzzy_fields=fuzzy_fields),
+            media_type="text/event-stream",
+        )
+
     async with async_session() as session:
         return await Model.paginated_by_query(
             session=session,
@@ -77,7 +87,7 @@ async def update_model(session: SessionDep, id: int, model_in: ModelUpdate):
         raise NotFoundException(message="Model not found")
 
     try:
-        await model.update(session, model_in)
+        await ModelService(session).update(model, model_in)
     except Exception as e:
         raise InternalServerErrorException(message=f"Failed to update model: {e}")
 
@@ -91,6 +101,6 @@ async def delete_model(session: SessionDep, id: int):
         raise NotFoundException(message="Model not found")
 
     try:
-        await model.delete(session)
+        await ModelService(session).delete(model)
     except Exception as e:
         raise InternalServerErrorException(message=f"Failed to delete model: {e}")

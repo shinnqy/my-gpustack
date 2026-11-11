@@ -3,6 +3,7 @@ from gpustack.api.exceptions import error_responses
 from gpustack.routes import models, probes
 from gpustack.routes import clusters, models, probes
 from gpustack.routes import clusters, models, probes, workers
+from gpustack.routes import clusters, model_instances, models, probes, workers
 
 
 versioned_prefix = "/v2"
@@ -21,6 +22,11 @@ v1_base_router.include_router(clusters.router, prefix="/clusters", tags=["Cluste
 
 
 v1_base_router.include_router(workers.router, prefix="/workers", tags=["Workers"])
+
+
+v1_base_router.include_router(
+    model_instances.router, prefix="/model-instances", tags=["Model Instances"]
+)
 
 
 v1_base_router.add_api_route(

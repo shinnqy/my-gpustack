@@ -8,6 +8,9 @@ from gpustack.schemas.models import (
     ModelInstance,
 )
 from gpustack.schemas.workers import Worker
+from gpustack.schemas.models import ModelInstanceStateEnum
+from gpustack.server.cache import delete_cache_by_key
+from gpustack.server.cache import locked_cached
 
 
 logger = logging.getLogger(__name__)
@@ -41,6 +44,20 @@ class ModelService:
     def __init__(self, session: AsyncSession):
         self.session = session
 
+    @locked_cached()
+    async def get_by_id(self, model_id: int) -> Optional[Model]:
+        result = await Model.one_by_id(self.session, model_id)
+        if result is not None:
+            self.session.expunge(result)
+        return result
+
+    @locked_cached()
+    async def get_by_name(self, name: str) -> Optional[Model]:
+        result = await Model.one_by_field(self.session, "name", name)
+        if result is not None:
+            self.session.expunge(result)
+        return result
+
     async def update(
         self,
         model: Model,
@@ -48,11 +65,26 @@ class ModelService:
         *,
         auto_commit: bool = True,
     ):
+        old_name = model.name
         result = await model.update(self.session, source, auto_commit=auto_commit)
+        await delete_cache_by_key(self.get_by_id, model.id)
+        await delete_cache_by_key(self.get_by_name, old_name)
+        if model.name != old_name:
+            await delete_cache_by_key(self.get_by_name, model.name)
         return result
 
     async def delete(self, model: Model):
+        instances = await ModelInstance.all_by_field(self.session, "model_id", model.id)
+        for instance in instances:
+            await instance.delete(self.session, auto_commit=False)
         result = await model.delete(self.session)
+        await delete_cache_by_key(self.get_by_id, model.id)
+        await delete_cache_by_key(self.get_by_name, model.name)
+        instance_service = ModelInstanceService(self.session)
+        await delete_cache_by_key(instance_service.get_running_instances, model.id)
+        for instance in instances:
+            await delete_cache_by_key(instance_service.get_by_id, instance.id)
+        await ModelInstance._invalidate_cached_all()
         return result
 
 
@@ -60,18 +92,44 @@ class ModelInstanceService:
     def __init__(self, session: AsyncSession):
         self.session = session
 
+    @locked_cached()
+    async def get_by_id(self, id: int) -> Optional[ModelInstance]:
+        result = await ModelInstance.one_by_id(self.session, id)
+        if result is None:
+            return None
+        self.session.expunge(result)
+        return result
+
+    @locked_cached()
+    async def get_running_instances(self, model_id: int) -> List[ModelInstance]:
+        results = await ModelInstance.all_by_fields(
+            self.session,
+            fields={"model_id": model_id, "state": ModelInstanceStateEnum.RUNNING},
+        )
+        if results is None:
+            return []
+
+        for result in results:
+            self.session.expunge(result)
+        return results
+
     async def create(self, model_instance):
         result = await ModelInstance.create(self.session, model_instance)
+        await delete_cache_by_key(self.get_running_instances, model_instance.model_id)
         return result
 
     async def update(
         self, model_instance: ModelInstance, source: Union[dict, SQLModel, None] = None
     ):
         result = await model_instance.update(self.session, source)
+        await delete_cache_by_key(self.get_running_instances, model_instance.model_id)
+        await delete_cache_by_key(self.get_by_id, model_instance.id)
         return result
 
     async def delete(self, model_instance: ModelInstance):
         result = await model_instance.delete(self.session)
+        await delete_cache_by_key(self.get_running_instances, model_instance.model_id)
+        await delete_cache_by_key(self.get_by_id, model_instance.id)
         return result
 
     async def batch_delete(self, model_instances: List[ModelInstance]):
@@ -83,6 +141,16 @@ class ModelInstanceService:
             for m in model_instances:
                 await m.delete(self.session, auto_commit=False)
             await self.session.commit()
+
+            # delete(auto_commit=False) returns before invalidating cached_all,
+            # so the batch commit must do it. Otherwise subscribe()'s replay
+            # snapshot keeps serving the deleted rows and watch reconnects
+            # resurrect them as ghost CREATED events.
+            await ModelInstance._invalidate_cached_all()
+            for model_id in {m.model_id for m in model_instances}:
+                await delete_cache_by_key(self.get_running_instances, model_id)
+            for instance in model_instances:
+                await delete_cache_by_key(self.get_by_id, instance.id)
 
             return names
         except Exception as e:

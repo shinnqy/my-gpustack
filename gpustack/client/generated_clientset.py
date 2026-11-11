@@ -2,6 +2,8 @@ import base64
 from .generated_http_client import HTTPClient
 from typing import Optional
 from .generated_worker_client import WorkerClient
+from .generated_model_client import ModelClient
+from .generated_model_instance_client import ModelInstanceClient
 
 
 class ClientSet:
@@ -17,7 +19,6 @@ class ClientSet:
     ):
         if headers is None:
             headers = {}
-
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         elif username and password:
@@ -25,10 +26,8 @@ class ClientSet:
                 f"{username}:{password}".encode()
             ).decode()
             headers["Authorization"] = f"Basic {base64_credentials}"
-
         self.base_url = base_url
         self.headers = headers
-
         http_client = (
             HTTPClient(
                 base_url=base_url,
@@ -37,8 +36,15 @@ class ClientSet:
             .with_timeout(timeout)
         )
         self.http_client = http_client
-
         self.workers = WorkerClient(
+            http_client,
+            enable_cache=enable_cache,
+        )
+        self.models = ModelClient(
+            http_client,
+            enable_cache=enable_cache,
+        )
+        self.model_instances = ModelInstanceClient(
             http_client,
             enable_cache=enable_cache,
         )

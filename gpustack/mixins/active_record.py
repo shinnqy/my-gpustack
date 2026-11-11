@@ -27,6 +27,15 @@ from sqlalchemy import event as sa_event, inspect
 from sqlalchemy.orm import Session
 from gpustack.server.bus import Event, EventType, event_bus
 from gpustack.server.db import async_session
+from typing import Awaitable
+from typing import Callable
+import importlib
+from fastapi.encoders import jsonable_encoder
+import json
+from gpustack.server.cache import class_key
+from gpustack.server.cache import locked_cached
+import anyio
+from gpustack.server.cache import delete_cache_by_key
 
 
 logger = logging.getLogger(__name__)
@@ -207,6 +216,13 @@ class ActiveRecordMixin:
             ]
             statement = statement.where(and_(*conditions))
 
+        if fuzzy_fields:
+            conditions = [
+                func.lower(getattr(cls, key)).like(f"%{str(value).lower()}%")
+                for key, value in fuzzy_fields.items()
+            ]
+            statement = statement.where(or_(*conditions))
+
         if extra_conditions:
             statement = statement.where(and_(*extra_conditions))
 
@@ -223,6 +239,13 @@ class ActiveRecordMixin:
                 col(getattr(cls, key)) == value for key, value in fields.items()
             ]
             count_statement = count_statement.where(and_(*conditions))
+
+        if fuzzy_fields:
+            conditions = [
+                func.lower(getattr(cls, key)).like(f"%{str(value).lower()}%")
+                for key, value in fuzzy_fields.items()
+            ]
+            count_statement = count_statement.where(or_(*conditions))
 
         if extra_conditions:
             count_statement = count_statement.where(and_(*extra_conditions))
@@ -330,6 +353,8 @@ class ActiveRecordMixin:
                 await session.refresh(self)
             if session.is_active:
                 await self._refresh_related_objects(session)
+            # Invalidate cached_all cache on successful write
+            await self.__class__._invalidate_cached_all()
         except (IntegrityError, OperationalError, FlushError) as e:
             await session.rollback()
             raise e
@@ -372,6 +397,8 @@ class ActiveRecordMixin:
         if not auto_commit:
             return
         await session.commit()
+        # Invalidate cached_all cache after successful delete
+        await self.__class__._invalidate_cached_all()
 
     async def _handle_cascade_delete(
         self, session: AsyncSession, soft=False, auto_commit=True
@@ -427,22 +454,33 @@ class ActiveRecordMixin:
         event_types: Optional[Iterable[EventType]] = None,
         replay_existing: bool = True,
     ) -> AsyncGenerator[Event, None]:
+        """Subscribe to bus events for this model.
+
+        ``source`` labels the consumer in queue-full logs. ``event_types``
+        whitelists pre-enqueue, so filtered events don't take queue slots.
+        ``replay_existing=False`` skips the initial CREATED snapshot for
+        consumers that bootstrap themselves.
+        """
         topic = cls.__name__.lower()
         subscriber = event_bus.subscribe(topic, source=source, event_types=event_types)
-
-        if replay_existing:
-            include_created = event_types is None or EventType.CREATED in event_types
-            if include_created:
-                # 阶段版：每次订阅都查一遍数据库。第 7 章换成带缓存的 cached_all
-                async with async_session() as session:
-                    initial_items = await cls.all(session, options=options)
-                for item in initial_items:
-                    yield Event(type=EventType.CREATED, data=item)
-
-        heartbeat_interval = timedelta(seconds=15)
-        last_event_time = datetime.now(timezone.utc)
+        logger.info(
+            "subscribed, source=%s topic=%s subscriber=%s",
+            source,
+            topic,
+            id(subscriber),
+        )
 
         try:
+            if replay_existing:
+                include_created = event_types is None or EventType.CREATED in event_types
+                if include_created:
+                    initial_items = await cls.cached_all(options=options)
+                    for item in initial_items:
+                        yield Event(type=EventType.CREATED, data=item)
+
+            heartbeat_interval = timedelta(seconds=15)
+            last_event_time = datetime.now(timezone.utc)
+
             while True:
                 try:
                     event = await asyncio.wait_for(
@@ -477,7 +515,166 @@ class ActiveRecordMixin:
             if auto_commit:
                 await session.commit()
 
+            # Invalidate cached_all cache after successful batch update
+            await cls._invalidate_cached_all()
             return len(updates)
         except Exception as e:
             await session.rollback()
             raise e
+
+    @classmethod
+    async def streaming(
+        cls,
+        fields: Optional[dict] = None,
+        fuzzy_fields: Optional[dict] = None,
+        filter_func: Optional[Callable[[Any], bool]] = None,
+        options: Optional[List] = None,
+        event_transform: Optional[Callable[[Event], Awaitable[None]]] = None,
+    ) -> AsyncGenerator[str, None]:
+        """Stream events matching the given criteria as JSON strings.
+
+        Args:
+            fields: Exact match filters as key-value pairs
+            fuzzy_fields: Fuzzy match filters
+            filter_func: Optional filter function to apply to event data
+            options: SQLAlchemy options for eager loading relationships (e.g., selectinload)
+            event_transform: Optional async hook called with the public Event
+                right before serialization. May mutate ``event.data`` in
+                place to inject fields derived from outside the raw
+                subscribe payload — used e.g. by /v2/workers to inject
+                allocated computed from current ModelInstance bindings so
+                the watch stream matches the REST response.
+        """
+        subscription = cls.subscribe(source="streaming", options=options)
+        try:
+            async for event in subscription:
+                if event.type == EventType.HEARTBEAT:
+                    yield "\n\n"
+                    continue
+
+                if not cls._match_fields(event, fields):
+                    continue
+
+                if not cls._match_fuzzy_fields(event, fuzzy_fields):
+                    continue
+
+                if filter_func and not filter_func(event.data):
+                    continue
+
+                public_event = Event(
+                    type=event.type,
+                    data=cls._convert_to_public_class(event.data),
+                    changed_fields=event.changed_fields,
+                    id=event.id,
+                )
+                if event_transform is not None:
+                    try:
+                        await event_transform(public_event)
+                    except Exception as e:
+                        logger.error(
+                            f"event_transform failed for {cls.__name__} "
+                            f"event {event.id}: {e}"
+                        )
+                formatted = cls._format_event(public_event)
+                if formatted is not None:
+                    yield formatted
+        except asyncio.CancelledError:
+            # Re-raise to ensure proper structured concurrency cancellation state
+            raise
+        except Exception as e:
+            logger.error(f"Error in streaming {cls.__name__}: {e}")
+        finally:
+            await subscription.aclose()
+
+    @classmethod
+    def _match_fields(cls, event: Any, fields: Optional[dict]) -> bool:
+        """Match fields using AND condition.
+
+        ``deleted_at: None`` is exempt on a DELETED event. Callers pass it to
+        mean "stream the live rows", but :meth:`delete` stamps ``deleted_at``
+        before the after-commit hook publishes, so matching it here dropped the
+        one event that says the row is gone — leaving it rendered on every open
+        page until a reload. :meth:`_format_event` already assumes the opposite,
+        keeping id-only payloads for DELETED alone so "clients can still remove
+        by ID from their cache".
+
+        The exemption is per-key, not per-event: every other filter still
+        applies, so a stream scoped to one cluster (or one name) never learns
+        about another's deletions. And only ``None`` is exempt — a concrete
+        timestamp would mean "this retirement", not "live rows".
+        """
+        for key, value in (fields or {}).items():
+            if (
+                key == "deleted_at"
+                and value is None
+                and event.type == EventType.DELETED
+            ):
+                continue
+            if getattr(event.data, key, None) != value:
+                return False
+        return True
+
+    @classmethod
+    def _match_fuzzy_fields(cls, event: Any, fuzzy_fields: Optional[dict]) -> bool:
+        """Match fuzzy fields using OR condition."""
+        for key, value in (fuzzy_fields or {}).items():
+            attr_value = str(getattr(event.data, key, "")).lower()
+            if str(value).lower() in attr_value:
+                return True
+        return not fuzzy_fields
+
+    @classmethod
+    def _convert_to_public_class(cls, data: Any) -> Any:
+        """Convert the instance to the corresponding Public class if it exists."""
+        # If data is a dict (e.g., ID-only event), return as-is
+        if isinstance(data, dict):
+            return data
+        class_module = importlib.import_module(cls.__module__)
+        public_class = getattr(class_module, f"{cls.__name__}Public", None)
+        return public_class.model_validate(data) if public_class else data
+
+    @staticmethod
+    def _format_event(event: Any) -> Optional[str]:
+        """Format the event as a JSON string."""
+        # Skip ID-only events for CREATED/UPDATED - they can't be properly validated by clients
+        # But allow ID-only for DELETED - clients can still remove by ID from their cache
+        if (
+            event.type != EventType.DELETED
+            and isinstance(event.data, dict)
+            and set(event.data.keys()) == {"id"}
+        ):
+            return None
+        return json.dumps(jsonable_encoder(event), separators=(",", ":")) + "\n\n"
+
+    @classmethod
+    async def _do_cached_all_query(cls, options: Optional[List] = None):
+        """Execute the cached_all query in a shielded context.
+
+        This runs the entire database operation including session cleanup
+        in a way that's protected from anyio cancellation.
+        """
+        session = async_session()
+        try:
+            results = await cls.all(session, options=options)
+            for item in results:
+                session.expunge(item)
+            return results
+        finally:
+            await session.close()
+
+    @classmethod
+    @locked_cached(key=class_key("cached_all"))
+    async def cached_all(cls, options: Optional[List] = None):
+        """Return all objects with caching for subscribe() initial data loading."""
+        logger.debug(f"Loading cached {cls.__name__} with options={options}")
+        # Run the entire database operation in a shielded context to protect
+        # from anyio cancellation. This prevents connection pool issues when
+        # CancelledError interrupts database operations or session cleanup.
+        with anyio.CancelScope(shield=True):
+            return await cls._do_cached_all_query(options)
+
+    @classmethod
+    async def _invalidate_cached_all(cls):
+        """Invalidate cached_all cache for this model class."""
+        cache_key = class_key("cached_all")(None, cls)
+        await delete_cache_by_key(_key=cache_key)

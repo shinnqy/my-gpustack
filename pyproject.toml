@@ -20,6 +20,8 @@ dependencies = [
     "psutil",
     "cachetools",
     "importlib-resources",
+    "aiocache>=0.12,<0.13",
+    "anyio>=4,<5",
 ]
 
 [dependency-groups]
