@@ -7,7 +7,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from gpustack.schemas.config import (
     PredefinedConfig,
     GatewayModeEnum,
+    PredefinedConfigNoDefaults,
 )
+from gpustack import __version__
 
 _config = None
 
@@ -33,6 +35,7 @@ class Config(WorkerConfig, BaseSettings):
     disable_worker: Optional[bool] = None  # Deprecated
     enable_worker: bool = False
     disable_openapi_docs: bool = False
+    server_external_url: Optional[str] = None
 
     _data_dir_was_fresh = False
 
@@ -164,3 +167,39 @@ def set_global_config(cfg: Config):
     global _config
     _config = cfg
     return cfg
+
+
+def get_image_name(
+    image_name_override: Optional[str],
+    registry: Optional[str] = None,
+    image_repo: str = "gpustack/gpustack",
+) -> str:
+    if image_name_override:
+        return image_name_override
+    # 真实版本：版本号来自扩展插件提供的 resolve_version_info()
+    version = __version__
+    if version.removeprefix("v") == "0.0.0":
+        version = "dev"
+    prefix = f"{registry}/" if registry else ""
+    return f"{prefix}{image_repo}:{version}"
+
+
+def get_cluster_image_name(
+    worker_config: Optional[PredefinedConfigNoDefaults],
+    cluster_registry: Optional[str] = None,
+) -> str:
+    cfg = get_global_config()
+    # 真实版本：determine_default_registry() 在没有配置时探测 Docker Hub / quay.io 哪个可达
+    registry = cluster_registry or cfg.system_default_container_registry
+    if worker_config is None:
+        return get_image_name(
+            image_repo=cfg.image_repo,
+            image_name_override=cfg.image_name_override,
+            registry=registry,
+        )
+    return get_image_name(
+        image_name_override=worker_config.image_name_override
+        or cfg.image_name_override,
+        image_repo=worker_config.image_repo or cfg.image_repo,
+        registry=registry,
+    )

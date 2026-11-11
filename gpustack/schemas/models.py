@@ -125,7 +125,7 @@ class ModelSpecBase(SQLModel, ModelSource):
 
 
 class ModelBase(ModelSpecBase):
-    pass
+    cluster_id: Optional[int] = Field(default=None, foreign_key="clusters.id")
 
 
 class Model(ModelBase, BaseModelMixin, table=True):
@@ -200,6 +200,7 @@ class ComputedResourceClaim(BaseModel):
 
 
 class ModelInstanceBase(SQLModel, ModelSource):
+    cluster_id: Optional[int] = Field(default=None, foreign_key="clusters.id")
     name: str = Field(index=True, unique=True)
     worker_id: Optional[int] = None
     worker_name: Optional[str] = None

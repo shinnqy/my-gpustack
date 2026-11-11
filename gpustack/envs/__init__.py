@@ -14,3 +14,8 @@ TCP_CONNECTOR_LIMIT = int(os.getenv("GPUSTACK_TCP_CONNECTOR_LIMIT", 1000))
 EVENT_BUS_SUBSCRIBER_QUEUE_SIZE = int(
     os.getenv("GPUSTACK_EVENT_BUS_SUBSCRIBER_QUEUE_SIZE", 1024)
 )
+
+"""用来决定 GPUStack 自动创建的默认集群使用哪种后端类型"""
+DEFAULT_CLUSTER_KUBERNETES = (
+    os.getenv("GPUSTACK_DEFAULT_CLUSTER_KUBERNETES", "false").lower() == "true"
+)

@@ -17,6 +17,7 @@ from gpustack.schemas.models import (
 )
 from gpustack.server.db import async_session
 from gpustack.server.deps import SessionDep
+from gpustack.schemas.clusters import Cluster
 
 router = APIRouter()
 
@@ -46,6 +47,16 @@ async def create_model(session: SessionDep, model_in: ModelCreate):
         raise AlreadyExistsException(
             message=f"Model with name '{model_in.name}' already exists."
         )
+
+    if model_in.cluster_id is None:
+        default_cluster = await Cluster.one_by_fields(
+            session, {"is_default": True, "deleted_at": None}
+        )
+        if default_cluster is None:
+            raise BadRequestException(message="cluster_id is required")
+        model_in.cluster_id = default_cluster.id
+    elif await Cluster.one_by_id(session, model_in.cluster_id) is None:
+        raise NotFoundException(message=f"Cluster {model_in.cluster_id} not found")
 
     try:
         model = await Model.create(session, source=model_in)

@@ -10,6 +10,11 @@ from sqlalchemy import JSON as SQLAlchemyJSON, TypeDecorator
 
 T = TypeVar("T", bound=BaseModel)
 
+class PublicFields:
+    id: int
+    created_at: datetime
+    updated_at: datetime
+    deleted_at: Optional[datetime] = None
 
 class Pagination(BaseModel):
     page: int

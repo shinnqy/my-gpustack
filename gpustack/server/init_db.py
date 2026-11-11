@@ -10,6 +10,9 @@ from sqlmodel import SQLModel
 from gpustack import envs
 from gpustack.server import db
 from gpustack.schemas.models import Model, ModelInstance
+from gpustack.schemas.clusters import (
+    Cluster,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,5 +56,6 @@ async def create_db_and_tables(engine: AsyncEngine):
                 Model.__table__,
                 # 存：每个副本的现实：在哪台机器、哪几张卡、什么状态、什么端口
                 ModelInstance.__table__,
+                Cluster.__table__,
             ]
         )

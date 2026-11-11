@@ -83,6 +83,9 @@ InternalServerErrorException = http_exception_factory(
 ServiceUnavailableException = http_exception_factory(
     status.HTTP_503_SERVICE_UNAVAILABLE, "ServiceUnavailable", "Service unavailable"
 )
+ConflictException = http_exception_factory(
+    status.HTTP_409_CONFLICT, "Conflict", "Conflict with existing resource"
+)
 
 
 class ErrorResponse(BaseModel):

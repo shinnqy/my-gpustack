@@ -150,6 +150,7 @@ async def sync_replicas(session: AsyncSession, model: Model):
                 model_scope_file_path=model.model_scope_file_path,
                 local_path=model.local_path,
                 state=ModelInstanceStateEnum.PENDING,
+                cluster_id=model.cluster_id,
                 backend=get_backend(model),
                 backend_version=model.backend_version,
             )
