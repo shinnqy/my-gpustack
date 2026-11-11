@@ -9,6 +9,10 @@ from gpustack.config.config import Config
 from gpustack.schemas.config import GatewayModeEnum
 from gpustack.server.app import create_app
 from gpustack.server.init_db import init_db
+from gpustack.server.controllers import (
+    ModelController,
+    ModelInstanceController
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +41,8 @@ class Server:
 
         app = create_app(self._config)
         self._app = app
+
+        self._start_leader_tasks()
 
         # 内嵌网关模式下，API 只监听本机，由网关对外；其他模式直接监听所有网卡
         serving_host = (
@@ -73,3 +79,25 @@ class Server:
     def _setup_data_dir(data_dir: str):
         if not os.path.exists(data_dir):
             os.makedirs(data_dir)
+
+    def _start_controllers(self):
+        """Start all controllers and return the list of tasks."""
+        tasks = []
+
+        model_controller = ModelController(self._config)
+        tasks.append(asyncio.create_task(model_controller.start()))
+
+        model_instance_controller = ModelInstanceController(self._config)
+        tasks.append(asyncio.create_task(model_instance_controller.start()))
+
+        logger.debug("Controllers started.")
+        return tasks
+
+    def _start_leader_tasks(self):
+        """Start tasks that run only on the leader.
+
+        Note: If leadership is lost, the process exits directly (os._exit),
+        so we don't need to track and cancel these tasks.
+        """
+        # Controllers
+        self._start_controllers()
