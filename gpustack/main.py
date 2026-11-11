@@ -1,6 +1,5 @@
 import argparse
 from multiprocessing import freeze_support
-
 from gpustack.cmd import setup_start_cmd
 
 
@@ -9,7 +8,6 @@ def main():
         description="GPUStack",
         conflict_handler="resolve",
         add_help=True,
-        # 帮助格式调整
         formatter_class=lambda prog: argparse.HelpFormatter(
             prog, max_help_position=55, indent_increment=2, width=200
         ),

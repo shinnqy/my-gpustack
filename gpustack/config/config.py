@@ -2,16 +2,21 @@ import logging
 import os
 from enum import Enum
 from typing import Optional
-
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from gpustack.schemas.config import (
     PredefinedConfig,
     GatewayModeEnum,
-    PredefinedConfigNoDefaults,
 )
 from gpustack import __version__
+from gpustack.schemas.config import PredefinedConfigNoDefaults
+from typing import Dict
+from gpustack.config.registration import read_registration_token
+from gpustack.config.registration import read_worker_token
+from pydantic import model_validator
+
 
 _config = None
+
 
 logger = logging.getLogger(__name__)
 
@@ -28,32 +33,38 @@ class WorkerConfig(PredefinedConfig):
 
 
 class Config(WorkerConfig, BaseSettings):
-    # The api_port is used in gpustack server/worker serving API requests.
     api_port: Optional[int] = 30080
+
     database_port: Optional[int] = 5432
+
     database_url: Optional[str] = None
+
     disable_worker: Optional[bool] = None  # Deprecated
+
     enable_worker: bool = False
+
     disable_openapi_docs: bool = False
+
     server_external_url: Optional[str] = None
+
+    _set_worker_fields = {}
 
     _data_dir_was_fresh = False
 
     model_config = SettingsConfigDict(
-        env_prefix="GPUSTACK_",
-        protected_namespaces=('settings_',),
-        # YAML 里写了 `Config` 没有的字段也不报错
-        extra="allow"
+        env_prefix="GPUSTACK_", protected_namespaces=('settings_',), extra="allow"
     )
 
     def __init__(self, **values):
         super().__init__(**values)
-
+        self._set_worker_fields = self.model_dump(
+            exclude_unset=True,
+            exclude_none=True,
+            include=self.__pydantic_fields_set__
+            & set(PredefinedConfig.model_fields.keys()),
+        )
         def prepare_dir(dir_path: Optional[str], default: str) -> str:
-            """用户给了路径就转成绝对路径"""
             return default if dir_path is None else os.path.abspath(dir_path)
-
-        # common options
         self.data_dir = prepare_dir(self.data_dir, self.get_data_dir())
         self._data_dir_was_fresh = not os.path.isdir(self.data_dir) or not os.listdir(
             self.data_dir
@@ -63,11 +74,49 @@ class Config(WorkerConfig, BaseSettings):
         )
         self.bin_dir = prepare_dir(self.bin_dir, os.path.join(self.data_dir, "bin"))
         self.log_dir = prepare_dir(self.log_dir, os.path.join(self.data_dir, "log"))
-
+        if self.token is None:
+            self.token = read_registration_token(self.data_dir)
+        if (
+            self._is_worker()
+            and self.token is None
+            and read_worker_token(self.data_dir) is None
+        ):
+            raise Exception("Token is required when running as worker")
         if self.system_reserved is None:
             self.system_reserved = {"ram": 0, "vram": 0}
-
         self.make_dirs()
+
+    @model_validator(mode="after")
+    def check_all(self):  # noqa: C901
+        if 'PYTEST_CURRENT_TEST' in os.environ:
+            # Skip validation during tests
+            return self
+
+        if self.server_url:
+            self.server_url = self.server_url.rstrip("/")
+
+        if self.service_port_range:
+            self.check_port_range(self.service_port_range)
+
+        if self.ray_port_range:
+            self.check_port_range(self.ray_port_range, diff=20)
+
+        return self
+
+    @staticmethod
+    def check_port_range(port_range: str, diff: Optional[int] = None):
+        ports = port_range.split("-")
+        if len(ports) != 2:
+            raise Exception(f"Invalid port range: {port_range}")
+        if not ports[0].isdigit() or not ports[1].isdigit():
+            raise Exception("Port range must be numeric")
+        if int(ports[0]) > int(ports[1]):
+            raise Exception(f"Invalid port range: {ports[0]} > {ports[1]}")
+        if diff is not None:
+            if int(ports[1]) - int(ports[0]) + 1 < diff:
+                raise Exception(
+                    f"Port range is too small: {port_range}, at least {diff} ports are required"
+                )
 
     def make_dirs(self):
         os.makedirs(self.data_dir, exist_ok=True)
@@ -84,8 +133,6 @@ class Config(WorkerConfig, BaseSettings):
 
     @staticmethod
     def get_data_dir():
-        """Linux 默认 `/var/lib/gpustack`，需要 root 权限。开发时请用 `--data-dir` 指到自己的目录"""
-
         app_name = "gpustack"
         if os.name == "nt":  # Windows
             data_dir = os.path.join(os.environ["APPDATA"], app_name)
@@ -97,9 +144,6 @@ class Config(WorkerConfig, BaseSettings):
         return os.path.abspath(data_dir)
 
     def _is_worker(self):
-        """
-        配了 `server_url` 就是 worker。这就是分流的依据：Worker 必须知道去哪找 Server，Server 不需要
-        """
         return self.server_url is not None
 
     class ServerRole(Enum):
@@ -116,10 +160,6 @@ class Config(WorkerConfig, BaseSettings):
             return self.ServerRole.SERVER
 
     def _is_both_role(self) -> bool:
-        """
-        没配 `server_url` 时，是“纯 server”还是“server + 内嵌 worker”？优先看用户的 `--enable-worker` / `--disable-worker`。
-        都没给时，全新安装默认纯 server
-        """
         if self._is_worker():
             return False
         elif self.enable_worker:
@@ -137,7 +177,6 @@ class Config(WorkerConfig, BaseSettings):
         return True
 
     def get_server_url(self) -> str:
-        """内嵌 worker 没有配 `server_url`，就连本机的 API 端口"""
         # returns server if not None else returns embedded server url
         return (
             self.server_url or f"http://127.0.0.1:{self.api_port}"
@@ -146,8 +185,6 @@ class Config(WorkerConfig, BaseSettings):
         )
 
     def get_api_port(self, embedded_worker: bool = False) -> int:
-        """同一个函数回答“我该监听哪个端口”"""
-
         if embedded_worker:
             return self.worker_port
         if self.server_role() != self.ServerRole.WORKER:
@@ -158,15 +195,40 @@ class Config(WorkerConfig, BaseSettings):
             else self.worker_port
         )
 
+    def reload_token(self):
+        token = read_registration_token(self.data_dir)
+        if token:
+            self.token = token
 
-def get_global_config() -> Config:
-    return _config
+    def reload_worker_config(self, worker_config: Optional[PredefinedConfigNoDefaults]):
+        if worker_config is None:
+            return
+        updated = {
+            **worker_config.model_dump(exclude_none=True),
+            **self._set_worker_fields,
+        }
+        for key, value in updated.items():
+            if key in self.__class__.model_fields:
+                setattr(self, key, value)
+        self.check_all()
 
-
-def set_global_config(cfg: Config):
-    global _config
-    _config = cfg
-    return cfg
+    def get_system_reserved(self) -> Dict[str, int]:
+        system_reserved_in_bytes = {**(self.system_reserved or {})}
+        ram = (
+            system_reserved_in_bytes.get(
+                "ram", system_reserved_in_bytes.pop("memory", 0)
+            )
+            or 0
+        )
+        vram = (
+            system_reserved_in_bytes.get(
+                "vram", system_reserved_in_bytes.pop("gpu_memory", 0)
+            )
+            or 0
+        )
+        system_reserved_in_bytes["ram"] = int(ram) << 30
+        system_reserved_in_bytes["vram"] = int(vram) << 30
+        return system_reserved_in_bytes
 
 
 def get_image_name(
@@ -203,3 +265,13 @@ def get_cluster_image_name(
         image_repo=worker_config.image_repo or cfg.image_repo,
         registry=registry,
     )
+
+
+def get_global_config() -> Config:
+    return _config
+
+
+def set_global_config(cfg: Config):
+    global _config
+    _config = cfg
+    return cfg

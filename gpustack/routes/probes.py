@@ -1,11 +1,14 @@
 from fastapi import APIRouter
 from gpustack import __version__, __git_commit__
 
+
 router = APIRouter()
 
-@router.get('/healthz')
+
+@router.get("/healthz")
 async def healthz():
-    return 'ok'
+    return "ok"
+
 
 @router.get("/readyz")
 async def readyz():

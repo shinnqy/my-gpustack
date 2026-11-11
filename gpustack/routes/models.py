@@ -1,6 +1,5 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import selectinload
-
 from gpustack.api.exceptions import (
     AlreadyExistsException,
     BadRequestException,
@@ -18,6 +17,7 @@ from gpustack.schemas.models import (
 from gpustack.server.db import async_session
 from gpustack.server.deps import SessionDep
 from gpustack.schemas.clusters import Cluster
+
 
 router = APIRouter()
 

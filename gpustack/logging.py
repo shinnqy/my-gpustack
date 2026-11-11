@@ -1,11 +1,7 @@
 import logging
 
+
 TRACE_LEVEL = 5
-
-
-def trace(self, message, *args, **kwargs):
-    if self.isEnabledFor(TRACE_LEVEL):
-        self._log(TRACE_LEVEL, message, args, **kwargs)
 
 
 def setup_logging(debug: bool = False):
@@ -18,3 +14,8 @@ def setup_logging(debug: bool = False):
     )
     logging.addLevelName(TRACE_LEVEL, "TRACE")
     logging.Logger.trace = trace
+
+
+def trace(self, message, *args, **kwargs):
+    if self.isEnabledFor(TRACE_LEVEL):
+        self._log(TRACE_LEVEL, message, args, **kwargs)

@@ -1,20 +1,22 @@
 from datetime import timezone, datetime
 import json
 from typing import ClassVar, Generic, List, Optional, Type, TypeVar
-
 from fastapi import Query
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, TypeAdapter, Field
 import sqlalchemy as sa
 from sqlalchemy import JSON as SQLAlchemyJSON, TypeDecorator
 
+
 T = TypeVar("T", bound=BaseModel)
+
 
 class PublicFields:
     id: int
     created_at: datetime
     updated_at: datetime
     deleted_at: Optional[datetime] = None
+
 
 class Pagination(BaseModel):
     page: int

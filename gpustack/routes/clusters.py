@@ -1,8 +1,6 @@
 import secrets
 from typing import Optional, Union
-
 from fastapi import APIRouter, Depends, Request
-
 from gpustack.api.exceptions import (
     AlreadyExistsException,
     InternalServerErrorException,
@@ -28,13 +26,35 @@ from gpustack.schemas.models import Model
 from gpustack.security import (
     API_KEY_PREFIX,
 )
-from gpustack.schemas.common import ListParams
 from gpustack.config.config import (
     get_global_config,
     get_cluster_image_name,
 )
+from gpustack.schemas.common import ListParams
+from sqlalchemy.orm import selectinload
+
 
 router = APIRouter()
+
+
+def get_server_url(request: Request, cluster_override: Optional[str]) -> str:
+    """Resolve the worker-facing server URL.
+
+    Priority:
+    1. cluster override
+    2. server_external_url
+    3. request host (scheme + netloc). ForwardedHostPortMiddleware only gates
+       X-Forwarded-Host rewriting by trusted_hosts; a directly supplied Host
+       header still flows into request.url, so this is not full host-injection
+       protection unless the server is reachable only via a trusted proxy.
+    """
+    if cluster_override:
+        return cluster_override.rstrip("/")
+    cfg = get_global_config()
+    url = cfg.server_external_url if cfg else None
+    if not url:
+        url = f"{request.url.scheme}://{request.url.netloc}"
+    return url.rstrip("/")
 
 
 @router.get("", response_model=ClustersPublic, response_model_exclude_none=True)
@@ -44,15 +64,41 @@ async def get_clusters(session: SessionDep, params: ListParams = Depends()):
         fields={"deleted_at": None},
         page=params.page,
         per_page=params.perPage,
+        options=[selectinload(Cluster.cluster_workers)],
     )
 
 
 @router.get("/{id}", response_model=ClusterPublic, response_model_exclude_none=True)
 async def get_cluster(session: SessionDep, id: int):
-    cluster = await Cluster.one_by_id(session, id)
+    cluster = await Cluster.one_by_id(
+        session, id, options=[selectinload(Cluster.cluster_workers)]
+    )
     if not cluster or cluster.deleted_at is not None:
         raise NotFoundException(message=f"cluster {id} not found")
     return cluster
+
+
+def hoist_system_default_container_registry(
+    input: Union[ClusterCreate, ClusterUpdate],
+):
+    """
+    Make ``cluster.system_default_container_registry`` the single source of
+    truth at persistence time.
+
+    If the caller put the value inside ``worker_config`` (the legacy shape),
+    promote it onto the top-level column and null it out in ``worker_config``
+    so downstream image-resolution helpers can read the cluster column
+    exclusively without ever reaching back into ``worker_config``. We don't
+    overwrite the column if the caller already set it.
+    """
+    if input.worker_config is None:
+        return
+    nested = input.worker_config.system_default_container_registry
+    if nested is None:
+        return
+    if not input.system_default_container_registry:
+        input.system_default_container_registry = nested
+    input.worker_config.system_default_container_registry = None
 
 
 @router.post("", response_model=ClusterPublic, response_model_exclude_none=True)
@@ -124,57 +170,6 @@ async def delete_cluster(session: SessionDep, id: int):
         raise InternalServerErrorException(message=f"Failed to delete cluster: {e}")
 
 
-@router.get("/{id}/registration-token", response_model=ClusterRegistrationTokenPublic)
-async def get_registration_token(request: Request, session: SessionDep, id: int):
-    cluster = await Cluster.one_by_id(session, id)
-    if not cluster or cluster.deleted_at is not None:
-        raise NotFoundException(message=f"cluster {id} not found")
-    return get_registration_from_cluster(request, cluster)
-
-
-def get_server_url(request: Request, cluster_override: Optional[str]) -> str:
-    """Resolve the worker-facing server URL.
-
-    Priority:
-    1. cluster override
-    2. server_external_url
-    3. request host (scheme + netloc). ForwardedHostPortMiddleware only gates
-       X-Forwarded-Host rewriting by trusted_hosts; a directly supplied Host
-       header still flows into request.url, so this is not full host-injection
-       protection unless the server is reachable only via a trusted proxy.
-    """
-    if cluster_override:
-        return cluster_override.rstrip("/")
-    cfg = get_global_config()
-    url = cfg.server_external_url if cfg else None
-    if not url:
-        url = f"{request.url.scheme}://{request.url.netloc}"
-    return url.rstrip("/")
-
-
-def hoist_system_default_container_registry(
-    input: Union[ClusterCreate, ClusterUpdate],
-):
-    """
-    Make ``cluster.system_default_container_registry`` the single source of
-    truth at persistence time.
-
-    If the caller put the value inside ``worker_config`` (the legacy shape),
-    promote it onto the top-level column and null it out in ``worker_config``
-    so downstream image-resolution helpers can read the cluster column
-    exclusively without ever reaching back into ``worker_config``. We don't
-    overwrite the column if the caller already set it.
-    """
-    if input.worker_config is None:
-        return
-    nested = input.worker_config.system_default_container_registry
-    if nested is None:
-        return
-    if not input.system_default_container_registry:
-        input.system_default_container_registry = nested
-    input.worker_config.system_default_container_registry = None
-
-
 def get_registration_from_cluster(
     request: Request, cluster: Cluster
 ) -> ClusterRegistrationTokenPublic:
@@ -191,3 +186,11 @@ def get_registration_from_cluster(
         env=parse_base_model_to_env_vars(sensitive_registration),
         args=[],
     )
+
+
+@router.get("/{id}/registration-token", response_model=ClusterRegistrationTokenPublic)
+async def get_registration_token(request: Request, session: SessionDep, id: int):
+    cluster = await Cluster.one_by_id(session, id)
+    if not cluster or cluster.deleted_at is not None:
+        raise NotFoundException(message=f"cluster {id} not found")
+    return get_registration_from_cluster(request, cluster)

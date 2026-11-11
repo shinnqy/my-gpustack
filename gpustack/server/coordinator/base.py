@@ -3,6 +3,7 @@ from typing import Any, Dict, Optional, Tuple
 from enum import Enum
 import logging
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -19,12 +20,8 @@ class EventType(Enum):
 
 @dataclass
 class Event:
-    # 创建、更新、删除。`HEARTBEAT` 不是数据变化，是“我还活着”的信号
     type: EventType
-    # 变化后的那一行（一个 `Model` 或 `ModelInstance` 对象）
     data: Any
-    # 哪些字段变了，旧值和新值是什么，形如 `{"state": (["pending"], ["scheduled"])}`。
-    # 为什么需要它？比如调度器只关心“状态变成 pending”，不关心“下载进度从 30% 变 31%”。有了它，订阅者可以快速跳过无关的更新
     changed_fields: Dict[str, Tuple[Any, Any]] = field(default_factory=dict)
     id: Optional[Any] = None
 
@@ -36,7 +33,6 @@ class Event:
 
     def refresh_id(self) -> None:
         if self.id is None:
-            # 从 `data.id` 推出事件的 `id`
             self.id = self._derive_id_from_data()
 
     def _derive_id_from_data(self) -> Optional[Any]:

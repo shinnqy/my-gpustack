@@ -4,9 +4,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 import logging
 from pydantic import BaseModel
+import httpx
 
 
 logger = logging.getLogger(__name__)
+
 
 HTTP_422_UNPROCESSABLE = (
     getattr(status, "HTTP_422_UNPROCESSABLE_CONTENT", None)
@@ -66,26 +68,118 @@ def http_exception_factory(
 AlreadyExistsException = http_exception_factory(
     status.HTTP_409_CONFLICT, "AlreadyExists", "Already exists"
 )
+
+
+ConflictException = http_exception_factory(
+    status.HTTP_409_CONFLICT, "Conflict", "Conflict with existing resource"
+)
+
+
 NotFoundException = http_exception_factory(
     status.HTTP_404_NOT_FOUND, "NotFound", "Not found"
 )
+
+
+UnauthorizedException = http_exception_factory(
+    status.HTTP_401_UNAUTHORIZED, "Unauthorized", "Unauthorized"
+)
+
+
+ForbiddenException = http_exception_factory(
+    status.HTTP_403_FORBIDDEN, "Forbidden", "Forbidden"
+)
+
+
 InvalidException = http_exception_factory(
     HTTP_422_UNPROCESSABLE, "Invalid", "Invalid input"
 )
+
+
 BadRequestException = http_exception_factory(
     status.HTTP_400_BAD_REQUEST, "BadRequest", "Bad request"
 )
+
+
 InternalServerErrorException = http_exception_factory(
     status.HTTP_500_INTERNAL_SERVER_ERROR,
     "InternalServerError",
     "Internal server error",
 )
+
+
 ServiceUnavailableException = http_exception_factory(
     status.HTTP_503_SERVICE_UNAVAILABLE, "ServiceUnavailable", "Service unavailable"
 )
-ConflictException = http_exception_factory(
-    status.HTTP_409_CONFLICT, "Conflict", "Conflict with existing resource"
+
+
+GatewayTimeoutException = http_exception_factory(
+    status.HTTP_504_GATEWAY_TIMEOUT, "GatewayTimeout", "Gateway timeout"
 )
+
+
+async def async_raise_if_response_error(response: httpx.Response):  # noqa: C901
+    if response.status_code < status.HTTP_400_BAD_REQUEST:
+        return
+    try:
+        await response.aread()
+    except httpx.ReadError as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            reason="Unknown",
+            message=str(e),
+        )
+    raise_errors(response)
+
+
+def raise_if_response_error(response: httpx.Response):  # noqa: C901
+    if response.status_code < status.HTTP_400_BAD_REQUEST:
+        return
+    raise_errors(response)
+
+
+def raise_errors(response: httpx.Response):
+    try:
+        response_json = response.json()
+        # Compatible with OpenAI API error format
+        if "error" in response_json and isinstance(response_json["error"], dict):
+            response_json = response_json["error"]
+            if "type" in response_json and isinstance(response_json["type"], str):
+                response_json["reason"] = response_json["type"]
+        error = ErrorResponse.model_validate(response_json)
+    except Exception:
+        raise HTTPException(response.status_code, "Unknown", response.text)
+
+    if response.status_code == status.HTTP_404_NOT_FOUND:
+        raise NotFoundException(error.message)
+
+    if (
+        response.status_code == status.HTTP_409_CONFLICT
+        and error.reason == "AlreadyExists"
+    ):
+        raise AlreadyExistsException(error.message)
+
+    if response.status_code == status.HTTP_401_UNAUTHORIZED:
+        raise UnauthorizedException(error.message)
+
+    if response.status_code == status.HTTP_403_FORBIDDEN:
+        raise ForbiddenException(error.message)
+
+    if response.status_code == HTTP_422_UNPROCESSABLE:
+        raise InvalidException(error.message)
+
+    if response.status_code == status.HTTP_400_BAD_REQUEST:
+        raise BadRequestException(error.message)
+
+    if response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR:
+        raise InternalServerErrorException(error.message)
+
+    if response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE:
+        raise ServiceUnavailableException(error.message)
+
+    if response.status_code == status.HTTP_504_GATEWAY_TIMEOUT:
+        raise GatewayTimeoutException(error.message)
+
+    raise HTTPException(error.code, error.reason, error.message)
 
 
 class ErrorResponse(BaseModel):

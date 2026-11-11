@@ -5,6 +5,7 @@ from gpustack.schemas.models import (
     ModelInstance,
 )
 
+
 logger = logging.getLogger(__name__)
 
 

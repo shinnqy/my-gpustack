@@ -11,7 +11,7 @@ def test_role_and_dirs():
         assert cfg.cache_dir == os.path.join(d, "cache")
         assert cfg.get_api_port() == 30080
 
-        worker = Config(data_dir=d, server_url="http://1.2.3.4")
+        worker = Config(data_dir=d, server_url="http://1.2.3.4", token="registration-token")
         assert worker.server_role() == Config.ServerRole.WORKER
         assert worker.get_api_port() == 10150  # worker 监听 worker_port
 

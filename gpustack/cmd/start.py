@@ -4,9 +4,7 @@ import logging
 import multiprocessing
 import sys
 from typing import Any, Dict
-
 import yaml
-
 from gpustack import __version__, __git_commit__
 from gpustack.config.config import set_global_config
 from gpustack.logging import setup_logging
@@ -14,6 +12,7 @@ from gpustack.utils.envs import get_gpustack_env, get_gpustack_env_bool
 from gpustack.worker.worker import Worker
 from gpustack.config import Config
 from gpustack.server.server import Server
+
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +114,7 @@ def start_cmd_options(parser_server: argparse.ArgumentParser):
     )
     parser_server.set_defaults(func=run)
 
+
 def run(args: argparse.Namespace):
     try:
         cfg = parse_args(args)
@@ -131,15 +131,14 @@ def run(args: argparse.Namespace):
         logger.exception(e)
         sys.exit(1)
 
+
 def run_server(cfg: Config):
     server = Server(
         config=cfg,
-        # spawn 模式下，`cfg` 会被 pickle 传给子进程。子进程的全局变量是空的，所以 `run_worker` 第一行要再 `set_global_config(cfg)`
         worker_process=multiprocessing.Process(target=run_worker, args=(cfg,)),
     )
 
     try:
-        # Server 整体是异步的（数据库、HTTP、后台循环都是协程）
         asyncio.run(server.start())
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
@@ -148,11 +147,12 @@ def run_server(cfg: Config):
     finally:
         logger.info("Server has shut down.")
 
+
 def run_worker(cfg: Config):
     set_global_config(cfg)
     worker = Worker(cfg)
-    # `Worker.start()` 是同步的，它在内部自己 `asyncio.run`，因为它启动前要做一些同步准备
     worker.start()
+
 
 def load_config_from_yaml(yaml_file: str) -> Dict[str, Any]:
     with open(yaml_file, "r") as file:

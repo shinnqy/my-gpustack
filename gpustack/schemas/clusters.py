@@ -14,7 +14,6 @@ from sqlmodel import (
     Text,
     String,
 )
-
 from gpustack.schemas.config import (
     PredefinedConfigNoDefaults,
     SensitivePredefinedConfig,
@@ -25,6 +24,15 @@ from gpustack.schemas.common import (
     PaginatedList,
     PublicFields,
 )
+from typing import List
+from pydantic import (
+    PrivateAttr,
+    computed_field,
+)
+from sqlmodel import (
+    Relationship,
+)
+from typing import TYPE_CHECKING
 
 
 class ClusterProvider(Enum):
@@ -96,13 +104,66 @@ class ClusterBase(ClusterCreateBase):
     is_default: bool = Field(default=False)
 
 
+if TYPE_CHECKING:
+    from gpustack.schemas.workers import Worker
+
+
 class Cluster(ClusterBase, BaseModelMixin, table=True):
     __tablename__ = "clusters"
+
     id: Optional[int] = Field(default=None, primary_key=True)
+
     hashed_suffix: str = Field(nullable=False, default=secrets.token_hex(6))
+
     registration_token: Optional[str] = Field(
         nullable=True, default=secrets.token_hex(16)
     )
+
+    cluster_workers: List["Worker"] = Relationship(
+        sa_relationship_kwargs={"cascade": "delete", "lazy": "noload"},
+        back_populates="cluster",
+    )
+
+    _workers: int = PrivateAttr(default=-1)
+
+    _ready_workers: int = PrivateAttr(default=-1)
+
+    _gpus: int = PrivateAttr(default=-1)
+
+    @computed_field()
+    @property
+    def workers(self) -> int:
+        try:
+            if self._workers >= 0:
+                return self._workers
+        except TypeError:
+            pass
+        return len(self.cluster_workers or [])
+
+    @computed_field()
+    @property
+    def ready_workers(self) -> int:
+        try:
+            if self._ready_workers >= 0:
+                return self._ready_workers
+        except TypeError:
+            pass
+        return len([w for w in self.cluster_workers or [] if w.state.value == 'ready'])
+
+    @computed_field(alias="gpus")
+    @property
+    def gpus(self) -> int:
+        try:
+            if self._gpus >= 0:
+                return self._gpus
+        except TypeError:
+            pass
+        count = 0
+        for worker in self.cluster_workers or []:
+            if worker.status is None or worker.status.gpu_devices is None:
+                continue
+            count += len(worker.status.gpu_devices)
+        return count
 
     def __hash__(self):
         return hash(self.id)

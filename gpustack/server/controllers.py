@@ -4,7 +4,6 @@ import string
 import asyncio
 from typing import List
 from sqlmodel.ext.asyncio.session import AsyncSession
-
 from gpustack.config.config import (
     Config,
 )
@@ -29,7 +28,9 @@ from gpustack.server.services import (
     ModelService,
 )
 
+
 logger = logging.getLogger(__name__)
+
 
 class ModelController:
     def __init__(self, cfg: Config):
@@ -64,6 +65,7 @@ class ModelController:
                 await sync_replicas(session, model)
         except Exception as e:
             logger.error(f"Failed to reconcile model {model.name}: {e}")
+
 
 class ModelInstanceController:
     def __init__(self, cfg: Config):
@@ -121,6 +123,7 @@ class ModelInstanceController:
                 f"{event_field(model_instance, 'name', instance_id)}: {e}"
             )
 
+
 async def sync_replicas(session: AsyncSession, model: Model):
     """
     Synchronize the replicas.
@@ -177,6 +180,7 @@ async def sync_replicas(session: AsyncSession, model: Model):
             if scale_down_instance_names:
                 logger.debug(f"Deleted model instances: {scale_down_instance_names}")
 
+
 async def find_scale_down_candidates(
     instances: List[ModelInstance],
     model: Model,
@@ -190,6 +194,7 @@ async def find_scale_down_candidates(
         for instance in instances
     ]
     return sorted(scored, key=lambda x: (x.score, -x.model_instance.id))
+
 
 async def sync_ready_replicas(session: AsyncSession, model: Model) -> bool:
     """
@@ -213,4 +218,3 @@ async def sync_ready_replicas(session: AsyncSession, model: Model) -> bool:
         await ModelService(session).update(model)
         return True
     return False
-

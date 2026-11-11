@@ -1,16 +1,14 @@
 import asyncio
 import logging
 from typing import Any, Dict, Iterable, List, Optional, Set
-
 from gpustack.envs import EVENT_BUS_SUBSCRIBER_QUEUE_SIZE
-
-# Re-export from coordinator.base for backward compatibility
 from gpustack.server.coordinator.base import (
     Event,
     EventType,
     event_field,
     resolve_event_id,
 )
+
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +24,6 @@ class Subscriber:
         self,
         topic: Optional[str] = None,
         source: Optional[str] = None,
-        # 过滤：有的订阅者只关心删除事件，就在订阅时声明，不相关的事件**在入队前**就丢掉，不占队列位置
         event_types: Optional[Iterable[EventType]] = None,
         queue_size: Optional[int] = None,
     ):
@@ -53,9 +50,6 @@ class Subscriber:
         return True
 
     async def enqueue(self, event: Event):
-        """
-        这里**“先释放锁，再 `put`”**：如果拿着锁去 `put`，队列满时会一直拿着锁等待。别的行的事件也要拿这把锁，就全被卡住了。所以只在改字典时持锁。
-        """
         if self._closed:
             return
 

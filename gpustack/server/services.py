@@ -1,16 +1,40 @@
 import logging
 from typing import List, Optional, Union
-
 from sqlmodel import SQLModel
 from sqlmodel.ext.asyncio.session import AsyncSession
-
 from gpustack.api.exceptions import InternalServerErrorException
 from gpustack.schemas.models import (
     Model,
     ModelInstance,
 )
+from gpustack.schemas.workers import Worker
+
 
 logger = logging.getLogger(__name__)
+
+
+class WorkerService:
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def update(
+        self, worker: Worker, source: Union[dict, SQLModel, None] = None, **kwargs
+    ):
+        result = await worker.update(self.session, source, **kwargs)
+        return result
+
+    async def batch_update(
+        self,
+        workers: List[Worker],
+        source: Union[dict, SQLModel, None] = None,
+        **kwargs,
+    ) -> int:
+        if not workers:
+            return 0
+
+        updated = await Worker.batch_update(self.session, workers)
+
+        return updated
 
 
 class ModelService:
