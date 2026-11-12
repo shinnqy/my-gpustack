@@ -28,6 +28,13 @@ from gpustack.server.services import (
     ModelInstanceService,
     ModelService,
 )
+from gpustack import envs
+from gpustack.policies.scorers.offload_layer_scorer import OffloadLayerScorer
+from gpustack.policies.scorers.placement_scorer import PlacementScorer
+from gpustack.policies.scorers.placement_scorer import ScaleTypeEnum
+from gpustack.policies.scorers.score_chain import ModelInstanceScoreChain
+from gpustack.policies.scorers.status_scorer import StatusScorer
+from typing import Optional
 
 
 logger = logging.getLogger(__name__)
@@ -191,16 +198,47 @@ async def sync_replicas(session: AsyncSession, model: Model):
 async def find_scale_down_candidates(
     instances: List[ModelInstance],
     model: Model,
+    *,
+    status_max_score: Optional[float] = None,
+    offload_max_score: Optional[float] = None,
+    placement_max_score: Optional[float] = None,
+    total_max_score: Optional[float] = None,
 ) -> List[ModelInstanceScore]:
-    # 阶段版：running 的得 1 分，其余得 0 分；分低的、id 大的（新建的）排前面
-    scored = [
-        ModelInstanceScore(
-            model_instance=instance,
-            score=1 if instance.state == ModelInstanceStateEnum.RUNNING else 0,
+    """缩容时，三个打分器，分数越低越先删"""
+    try:
+        if status_max_score is None:
+            status_max_score = envs.SCHEDULER_SCALE_DOWN_STATUS_MAX_SCORE
+        if offload_max_score is None:
+            offload_max_score = envs.SCHEDULER_SCALE_DOWN_OFFLOAD_MAX_SCORE
+        if placement_max_score is None:
+            placement_max_score = envs.SCHEDULER_SCALE_DOWN_PLACEMENT_MAX_SCORE
+
+        # 按权重归一化后相加
+        chain = ModelInstanceScoreChain(
+            scorers=[
+                StatusScorer(model, max_score=status_max_score),
+                OffloadLayerScorer(model, max_score=offload_max_score),
+                PlacementScorer(
+                    model,
+                    instances,
+                    scale_type=ScaleTypeEnum.SCALE_DOWN,
+                    max_score=placement_max_score,
+                ),
+            ],
+            # 把总分缩放到指定范围
+            total_max_score=total_max_score,
         )
-        for instance in instances
-    ]
-    return sorted(scored, key=lambda x: (x.score, -x.model_instance.id))
+        final_candidates = await chain.score(instances)
+        final_candidates = sorted(
+            final_candidates, key=lambda x: x.score, reverse=False
+        )
+        return final_candidates
+    except Exception as e:
+        state_message = (
+            f"Failed to find scale down candidates for model {model.name}: {e}"
+        )
+        logger.error(state_message)
+        return []
 
 
 async def sync_ready_replicas(session: AsyncSession, model: Model) -> bool:

@@ -50,3 +50,24 @@ def group_gpu_ids_by_worker(gpu_ids: list) -> dict:
     for worker_name, gpu_ids in worker_gpu_ids.items():
         worker_gpu_ids[worker_name] = sorted(gpu_ids)
     return worker_gpu_ids
+
+
+def group_gpu_indexes_by_gpu_type_and_worker(gpu_ids: list) -> dict:
+    """
+    整理手动指定的 GPU:
+        - 把用户选中的显卡，按“设备类型 → 机器 → 卡号”整理好，方便调度器查找
+    """
+    result = {}
+    for gpu_id in gpu_ids:
+        is_valid, matched = parse_gpu_id(gpu_id)
+        if not is_valid:
+            raise ValueError(f"Invalid GPU ID: {gpu_id}")
+        worker = matched["worker_name"]
+        gpu_type = matched["device"]
+        gpu_index = int(matched["gpu_index"])
+        result.setdefault(gpu_type, {}).setdefault(worker, []).append(gpu_index)
+    # Sort indexes for each type/worker
+    return {
+        t: {w: sorted(idx) for w, idx in workers.items()}
+        for t, workers in result.items()
+    }

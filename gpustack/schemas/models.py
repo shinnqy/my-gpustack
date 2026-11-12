@@ -54,11 +54,28 @@ class GPUSelector(BaseModel):
 
 class ModelSource(BaseModel):
     source: SourceEnum
+
     huggingface_repo_id: Optional[str] = None
+
     huggingface_filename: Optional[str] = None
+
     model_scope_model_id: Optional[str] = None
+
     model_scope_file_path: Optional[str] = None
+
     local_path: Optional[str] = None
+
+    @property
+    def readable_source(self) -> str:
+        values = []
+        if self.source == SourceEnum.HUGGING_FACE:
+            values.extend([self.huggingface_repo_id, self.huggingface_filename])
+        elif self.source == SourceEnum.MODEL_SCOPE:
+            values.extend([self.model_scope_model_id, self.model_scope_file_path])
+        elif self.source == SourceEnum.LOCAL_PATH:
+            values.extend([self.local_path])
+
+        return "/".join([value for value in values if value is not None])
 
     @model_validator(mode="after")
     def check_huggingface_fields(self):
@@ -290,6 +307,32 @@ class ModelInstancePublic(
 
 
 ModelInstancesPublic = PaginatedList[ModelInstancePublic]
+
+
+def is_audio_model(model: Model):
+    """
+    Check if the model is a STT or TTS model.
+    Args:
+        model: Model to check.
+    """
+    if model.backend == BackendEnum.VOX_BOX:
+        return True
+
+    if model.categories:
+        return (
+            'speech_to_text' in model.categories or 'text_to_speech' in model.categories
+        )
+
+    return False
+
+
+def is_llm_model(model: Model):
+    """
+    Check if the model is an LLM model.
+    Args:
+        model: Model to check.
+    """
+    return not model.categories or CategoryEnum.LLM in model.categories
 
 
 def get_backend(model: Model) -> str:

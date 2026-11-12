@@ -10,13 +10,33 @@ from gpustack.scheduler.queue import AsyncUniqueQueue
 from gpustack.scheduler.scheduler import Scheduler, find_candidate, pick_highest_score_candidate
 from gpustack.schemas.models import GPUSelector, Model, ModelInstance, ModelInstanceStateEnum
 from gpustack.schemas.workers import (
-    Worker, WorkerStateEnum, WorkerStatus, GPUDeviceStatus, MemoryInfo,
+    Worker, WorkerStateEnum, WorkerStatus, GPUDeviceStatus, MemoryInfo, SystemReserved,
 )
 from gpustack.server import db
 from gpustack.server.bus import event_bus
 from gpustack.server.services import ModelInstanceService
 
 from test_watch import eventually, project_context, seed
+
+
+@pytest.fixture(autouse=True)
+def model_metadata(monkeypatch):
+    from transformers import PretrainedConfig
+    from gpustack.policies.candidate_selectors import base_candidate_selector, vllm_resource_fit_selector
+
+    async def load_config(*args, **kwargs):
+        return PretrainedConfig(
+            architectures=["Qwen3ForCausalLM"], num_attention_heads=32,
+            num_key_value_heads=8, num_hidden_layers=8, hidden_size=1024,
+            vocab_size=128000, max_position_embeddings=32768,
+        )
+
+    async def estimate(*args, **kwargs):
+        return 3 << 30
+
+    monkeypatch.setattr(base_candidate_selector, "get_pretrained_config_with_workers", load_config)
+    monkeypatch.setattr(scheduler_module, "get_pretrained_config_with_workers", load_config)
+    monkeypatch.setattr(vllm_resource_fit_selector, "estimate_model_vram", estimate)
 
 
 def instance_record(id=1, state="pending", worker_id=None, updated_seconds=0, lifetime_seconds=600):
@@ -29,17 +49,18 @@ def instance_record(id=1, state="pending", worker_id=None, updated_seconds=0, li
     )
 
 
-def worker_record(id=1, cluster_id=1, ready=True, gpu=True, labels=None):
+def worker_record(id=1, cluster_id=1, ready=True, gpu=True, labels=None, gpu_count=1, gpu_memory=64 << 30):
     return Worker(
         id=id, cluster_id=cluster_id, name=f"worker-{id}", hostname=f"worker-{id}",
         ip=f"10.0.0.{id}", advertise_address=f"10.1.0.{id}", ifname="eth0", port=10150,
         worker_uuid=f"worker-uuid-{id}", labels=labels or {"os": "linux", "gpu": "ascend"},
         state=WorkerStateEnum.READY if ready else WorkerStateEnum.NOT_READY,
         heartbeat_time=datetime.now(timezone.utc),
-        status=WorkerStatus(gpu_devices=[GPUDeviceStatus(
-            index=2, type="cann", name="Ascend910B", uuid=f"device-{id}",
-            memory=MemoryInfo(total=64 << 30),
-        )] if gpu else []),
+        system_reserved=SystemReserved(ram=0, vram=0),
+        status=WorkerStatus(memory=MemoryInfo(total=128 << 30), gpu_devices=[GPUDeviceStatus(
+            index=2 + index, type="cann", name="Ascend910B", uuid=f"device-{id}-{index}",
+            memory=MemoryInfo(total=gpu_memory),
+        ) for index in range(gpu_count)] if gpu else []),
     )
 
 
@@ -106,7 +127,7 @@ def test_candidate_filters_cluster_gpu_labels_and_readiness(tmp_path):
         model = Model(
             id=1, name="qwen", source="huggingface", huggingface_repo_id="Qwen/test",
             cluster_id=1, worker_selector={"gpu": "ascend"},
-            gpu_selector=GPUSelector(gpu_ids=["worker-2:cann:2", "worker-3:cann:2", "worker-4:cann:2"]),
+            gpu_selector=GPUSelector(gpu_ids=["worker-2:cann:2", "worker-3:cann:2", "worker-4:cann:2"], gpus_per_replica=1),
         )
         workers = [
             worker_record(1, cluster_id=2), worker_record(2, ready=False),
@@ -116,7 +137,7 @@ def test_candidate_filters_cluster_gpu_labels_and_readiness(tmp_path):
         assert candidate.worker.id == 4
         assert candidate.gpu_type == "cann"
         assert candidate.gpu_indexes == [2]
-        assert candidate.computed_resource_claim.vram == {2: 0}
+        assert candidate.computed_resource_claim.vram == {2: int((64 << 30) * 0.9)}
         assert "cluster selector" in "".join(messages)
         assert "gpu selector" in "".join(messages)
         assert "label selector" in "".join(messages)
@@ -128,7 +149,7 @@ def test_candidate_filters_cluster_gpu_labels_and_readiness(tmp_path):
     ({"cluster_id": 2}, {}, "cluster selector"),
     ({"ready": False}, {}, "READY status"),
     ({}, {"gpu": "h100"}, "label selector"),
-    ({"gpu": False}, {}, "No GPU found"),
+    ({"gpu": False}, {}, "requires approximately"),
 ])
 def test_candidate_failure_explains_reason(tmp_path, worker_options, selector, reason):
     async def check():
@@ -264,7 +285,7 @@ def test_startup_and_created_events_schedule_without_processing_updates(tmp_path
     async def check():
         async with project_context(tmp_path, monkeypatch, database_file=True) as env:
             model, first = await seed(env.client)
-            await add_worker(model["cluster_id"])
+            await add_worker(model["cluster_id"], gpu_count=2)
             scheduler = Scheduler(env.cfg)
             events = []
             original = scheduler._enqueue_event_instance

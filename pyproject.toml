@@ -23,6 +23,9 @@ dependencies = [
     "aiocache>=0.12,<0.13",
     "anyio>=4,<5",
     "apscheduler>=3.10.4,<4.0.0",
+    "huggingface-hub>=1.0.0,<2",
+    "modelscope>=1.28,<2",
+    "transformers>=4.51.3,!=4.57.0,<6",
 ]
 
 [dependency-groups]

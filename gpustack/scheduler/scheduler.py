@@ -28,6 +28,21 @@ from typing import List
 from typing import Tuple
 from gpustack.schemas.models import ComputedResourceClaim
 import logging
+from gpustack.policies.candidate_selectors import VLLMResourceFitSelector
+from gpustack.policies.scorers.placement_scorer import PlacementScorer
+from gpustack.policies.scorers.score_chain import CandidateScoreChain
+from gpustack.scheduler.calculator import get_pretrained_config_with_workers
+from gpustack.scheduler.meta_registry import get_model_meta
+from gpustack.scheduler.model_registry import detect_model_type
+from gpustack.schemas.models import BackendEnum
+from gpustack.schemas.models import CategoryEnum
+from gpustack.server.services import ModelService
+from gpustack.schemas.models import get_backend
+from gpustack.utils.command import find_parameter
+import json
+from gpustack.policies.utils import should_skip_gpu_count_check
+from gpustack.utils.math import largest_power_of_2_leq
+from sqlalchemy.orm.attributes import flag_modified
 
 
 logger = logging.getLogger(__name__)
@@ -108,7 +123,9 @@ class Scheduler:
             logger.error(f"Failed to evaluate instance {instance.id} from event: {e}")
 
     async def _evaluate(self, instance: ModelInstance):  # noqa: C901
-        """先评估，在串行放置"""
+        """
+        开始评估配置与资源，决定如何分配
+        """
         async with async_session() as session:
             try:
                 instance = await ModelInstance.one_by_id(session, instance.id)
@@ -128,7 +145,27 @@ class Scheduler:
                     instance.state_message = "Evaluating resource requirements"
                     await ModelInstanceService(session).update(instance)
 
-                # 第 9 章在这里读取模型配置（config.json），估算资源需求
+                # Get available workers for potential remote parsing
+                workers = await Worker.all(session)
+
+                should_update_model = False
+                try:
+                    should_update_model = await evaluate_pretrained_config(
+                        model,
+                        workers=workers,
+                        raise_raw=True,
+                    )
+                except Exception as e:
+                    # Even if the evaluation failed, we still want to proceed to deployment.
+                    # Cases can be:
+                    # 1. Model config is not valid, but is overridable by backend parameters.
+                    # 2. It may not be required to be transformer-compatible for certain backends.
+                    logger.error(
+                        f"Failed to evaluate model {model.name or model.readable_source}: {e}"
+                    )
+
+                if should_update_model:
+                    await ModelService(session).update(model)
 
                 await self._queue.put(instance)
             except Exception as e:
@@ -229,6 +266,7 @@ class Scheduler:
             model_instances = await ModelInstance.all(
                 session, options=[selectinload(ModelInstance.model)]
             )
+            model_instances = [other for other in model_instances if other.id != model_instance.id]
 
             candidate = None
             messages = []
@@ -287,33 +325,6 @@ class Scheduler:
                 )
 
 
-class _AnyGPUSelector:
-    """阶段版：每张卡都是一个候选，不检查显存。第 9 章换成 VLLMResourceFitSelector。"""
-
-    def __init__(self, model: Model):
-        self._model = model
-
-    async def select_candidates(
-        self, workers: List[Worker]
-    ) -> List[ModelInstanceScheduleCandidate]:
-        candidates = []
-        for worker in workers:
-            for gpu in (worker.status.gpu_devices or []) if worker.status else []:
-                candidates.append(
-                    ModelInstanceScheduleCandidate(
-                        worker=worker,
-                        gpu_indexes=[gpu.index],
-                        gpu_type=gpu.type,
-                        computed_resource_claim=ComputedResourceClaim(vram={gpu.index: 0}),
-                        score=0,
-                    )
-                )
-        return candidates
-
-    def get_messages(self) -> List[str]:
-        return ["No GPU found on matched workers."]
-
-
 async def find_candidate(
     session: AsyncSession,
     config: Config,
@@ -322,8 +333,9 @@ async def find_candidate(
     model_instances: List[ModelInstance],
 ) -> Tuple[Optional[ModelInstanceScheduleCandidate], List[str]]:
     """
-    过滤 Worker，然后选 GPU
+    接上真正的资源匹配和评分
     """
+
     # Filter workers.
     filters = [
         ClusterFilter(model),
@@ -332,6 +344,7 @@ async def find_candidate(
         StatusFilter(model),
     ]
 
+    """哪些机器符合基本条件"""
     worker_filter_chain = WorkerFilterChain(filters)
     workers, filter_messages = await worker_filter_chain.filter(workers)
     messages = []
@@ -340,18 +353,38 @@ async def find_candidate(
     if len(workers) == 0:
         return None, messages
 
-    # 为每张可见 GPU 生成一个候选
-    candidates_selector = _AnyGPUSelector(model)
+    # Initialize candidate selector.
+    try:
+        # 阶段版：只有 vLLM。真实代码是一串 if/elif，第 19 章补全
+        """哪些单卡、多卡方案放得下"""
+        candidates_selector = VLLMResourceFitSelector(
+            config, model, model_instances
+        )
+    except Exception as e:
+        return None, [f"Failed to initialize {model.backend} candidates selector: {e}"]
 
     # Select candidates.
     candidates = await candidates_selector.select_candidates(workers)
 
-    # Pick the highest score candidate.
+    """可行方案中哪个更合适"""
+    candidate_scorers = [
+        PlacementScorer(model, model_instances),
+    ]
+    candidates = await CandidateScoreChain(candidate_scorers).score(candidates)
+
+    """取最高分方案"""
     candidate = pick_highest_score_candidate(candidates)
 
+    # Collect messages.
     if candidate is None and len(workers) > 0:
+        resource_fit_messages = candidates_selector.get_messages() or [
+            "No workers meet the resource requirements."
+        ]
+        messages.extend(resource_fit_messages)
+    elif candidate and candidate.overcommit:
         messages.extend(candidates_selector.get_messages())
 
+    # Return the candidate and messages.
     return candidate, messages
 
 
@@ -367,3 +400,193 @@ def pick_highest_score_candidate(candidates: List[ModelInstanceScheduleCandidate
             candidate = candidates[i]
 
     return candidate
+
+
+async def evaluate_pretrained_config(
+    model: Model,
+    workers: Optional[List[Worker]] = None,
+    raise_raw: bool = False,
+) -> bool:
+    """
+    评估元数据
+    """
+    # 2) Check overrided architectures if specified in backend parameters.
+    architectures = get_vllm_override_architectures(model)
+    if not architectures:
+        try:
+            trust_remote_code = _extract_trust_remote_code(model)
+            pretrained_config = await get_pretrained_config_with_workers(
+                model,
+                workers=workers,
+                trust_remote_code=trust_remote_code,
+            )
+        except ValueError as e:
+            # Skip value error exceptions and defaults to LLM catagory for certain cases.
+            if should_skip_architecture_check(model):
+                model.categories = model.categories or [CategoryEnum.LLM]
+                return True
+
+            if raise_raw:
+                raise
+
+            logger.debug(
+                f"Failed to get config for model {model.name or model.readable_source}, ValueError: {e}"
+            )
+            raise simplify_auto_config_value_error(e)
+        except (TimeoutError, asyncio.TimeoutError) as e:
+            raise Exception(
+                f"Timeout while getting config for model {model.name or model.readable_source}: {e}."
+            )
+        except Exception as e:
+            raise Exception(
+                f"Failed to get config for model {model.name or model.readable_source}: {e}"
+            )
+
+        architectures = getattr(pretrained_config, "architectures", []) or []
+        if not architectures and not model.backend_version:
+            raise ValueError(
+                "Unrecognized architecture. To proceed with deployment, ensure the model is supported by backend, or deploy it using a custom backend version or custom backend."
+            )
+
+    model_type = detect_model_type(architectures)
+
+    # TODO : Additional checks for unsupported architectures for other backends.
+    if (
+        model.backend == BackendEnum.VLLM
+        and model_type == CategoryEnum.UNKNOWN
+        and not model.backend_version
+    ):
+        raise ValueError(
+            f"Unsupported architecture: {architectures}. To proceed with deployment, ensure the model is supported by backend, or deploy it using a custom backend version or custom backend."
+        )
+
+    meta_modified = False
+    if not model.meta and (known_meta := get_model_meta(pretrained_config)):
+        model.meta = known_meta
+        meta_modified = True
+
+    categories_modified = set_model_categories(model, model_type)
+    gpus_per_replica_modified = set_model_gpus_per_replica(model)
+    return categories_modified or gpus_per_replica_modified or meta_modified
+
+
+def _extract_trust_remote_code(model: Model) -> bool:
+    """读取是否指定了 --trust-remote-code"""
+    if model.backend_parameters and "--trust-remote-code" in model.backend_parameters:
+        return True
+    return False
+
+
+def get_vllm_override_architectures(model: Model) -> List[str]:
+    """
+    解析 --hf-overrides 中覆盖的架构
+    """
+    backend = get_backend(model)
+    if backend != BackendEnum.VLLM:
+        return []
+
+    hf_overrides = find_parameter(model.backend_parameters, ["hf-overrides"])
+    if hf_overrides:
+        overrides_dict = json.loads(hf_overrides)
+        return overrides_dict.get("architectures", [])
+    return []
+
+
+def should_skip_architecture_check(model: Model) -> bool:
+    """
+    决定部分配置异常是否允许放宽处理
+    """
+
+    if (
+        model.backend == BackendEnum.CUSTOM
+        or model.backend_version
+    ):
+        # New model architectures may be added with custom backend/version.
+        return True
+
+    if model.backend_parameters and find_parameter(
+        model.backend_parameters, ["tokenizer-mode"]
+    ):
+        # Models like Pixtral may not provide compatible config but still work with custom parameters.
+        return True
+
+    return False
+
+
+def simplify_auto_config_value_error(e: ValueError) -> ValueError:
+    """
+    将依赖库异常整理成较清楚的提示
+    """
+    message = str(e)
+    if "trust_remote_code=True" in message:
+        return ValueError(
+            "The model contains custom code that must be executed to load correctly. If you trust the source, please pass the backend parameter `--trust-remote-code` to allow custom code to be run."
+        )
+
+    if "pip install --upgrade transformers" in message:
+        return ValueError(
+            "Unsupported model. To proceed with deployment, ensure the model is supported by backend, or deploy it using a custom backend version or custom backend."
+        )
+
+    return ValueError(f"Not a supported model.\n\n{message}")
+
+
+def set_model_categories(model: Model, model_type: CategoryEnum) -> bool:
+    """类别为空时补充识别结果，保留已有类别"""
+    if model.categories:
+        return False
+
+    if model_type == CategoryEnum.UNKNOWN:
+        # Default to LLM for unknown architectures
+        model.categories = [CategoryEnum.LLM]
+    else:
+        model.categories = [model_type]
+
+    return True
+
+
+def set_model_gpus_per_replica(model: Model) -> bool:
+    """
+    只在手动指定了 GPU ID、但尚未明确每副本卡数时进行补充
+    """
+
+    def calculate_gpus_per_replica(model: Model) -> int:
+        if model.backend == BackendEnum.VOX_BOX.value:
+            return 1
+
+        replicas = model.replicas or 1
+        gpus_per_replica = len(model.gpu_selector.gpu_ids) // replicas
+
+        if should_skip_gpu_count_check(model):
+            return gpus_per_replica
+
+        # User-specified world size from backend parameters takes precedence.
+        if model.backend_parameters is not None:
+            selector_map = {
+                BackendEnum.VLLM.value: VLLMResourceFitSelector,
+            }
+            selector = selector_map.get(model.backend or BackendEnum.VLLM)
+            world_size = None
+            if selector:
+                result = selector.get_world_size_from_backend_parameters(model)
+                world_size, _ = result if result is not None else (None, None)
+            if world_size and world_size > 0:
+                return world_size
+
+        # The largest power of 2 less than or equal to (total GPUs / replicas), used as the initial per-replica GPU count.
+        return largest_power_of_2_leq(gpus_per_replica)
+
+    if not model.gpu_selector or not model.gpu_selector.gpu_ids:
+        return False
+
+    if model.gpu_selector.gpus_per_replica and model.gpu_selector.gpus_per_replica > 0:
+        return False
+
+    gpus_per_replica = calculate_gpus_per_replica(model)
+    model.gpu_selector.gpus_per_replica = gpus_per_replica
+    try:
+        flag_modified(model, "gpu_selector")
+    except AttributeError:
+        # Ignore if the given model is not a SQLModel instance.
+        pass
+    return True
