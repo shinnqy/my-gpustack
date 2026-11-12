@@ -61,7 +61,12 @@ class WorkerStatusCollector:
         if not initial:
             try:
                 gpu_devices = self._detector_factory.detect_gpus()
-                status.gpu_devices = gpu_devices
+                # status.gpu_devices = gpu_devices
+                # FIXME: 第九章实验：只向 GPUStack 上报 0、1 两张卡
+                status.gpu_devices = [
+                    gpu for gpu in gpu_devices
+                    if gpu.index in {0, 1}
+                ]
             except GPUDetectExepction as e:
                 state_message = str(e)
             except Exception as e:
