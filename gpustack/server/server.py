@@ -23,6 +23,7 @@ from gpustack.security import (
 from gpustack.server.db import async_session
 from gpustack.config.registration import write_registration_token
 from gpustack.server.worker_status_buffer import flush_worker_status_to_db
+from gpustack.scheduler.scheduler import Scheduler
 
 
 logger = logging.getLogger(__name__)
@@ -105,11 +106,10 @@ class Server:
 
     def _start_leader_tasks(self):
         """Start tasks that run only on the leader.
-
         Note: If leadership is lost, the process exits directly (os._exit),
         so we don't need to track and cancel these tasks.
         """
-        # Controllers
+        self._start_scheduler()
         self._start_controllers()
 
     def _should_create_default_cluster(self) -> bool:
@@ -176,3 +176,10 @@ class Server:
         self._create_async_task(flush_worker_status_to_db())
 
         logger.debug("Worker status flusher started.")
+
+    def _start_scheduler(self):
+        """Start the scheduler and return the task."""
+        scheduler = Scheduler(self._config)
+        task = asyncio.create_task(scheduler.start())
+        logger.debug("Scheduler started.")
+        return task

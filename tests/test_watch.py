@@ -29,11 +29,15 @@ from gpustack.server.controllers import ModelInstanceController
 
 
 @asynccontextmanager
-async def project_context(tmp_path, monkeypatch):
+async def project_context(tmp_path, monkeypatch, database_file=False):
     setup_logging()
     cfg = Config(data_dir=str(tmp_path / "server"), token="bootstrap")
     monkeypatch.setattr(config_module, "_config", cfg)
-    engine = create_async_engine("sqlite+aiosqlite://")
+    database_url = (
+        "sqlite+aiosqlite:///" + str(tmp_path / "project.sqlite")
+        if database_file else "sqlite+aiosqlite://"
+    )
+    engine = create_async_engine(database_url)
     monkeypatch.setattr(db, "engine", engine)
     await cache_module.cache.clear()
     cache_module._cache_locks.clear()
