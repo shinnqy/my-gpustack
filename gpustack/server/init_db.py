@@ -6,6 +6,8 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 from sqlmodel import SQLModel
+from sqlalchemy import inspect
+from sqlalchemy.schema import CreateColumn
 from gpustack import envs
 from gpustack.server import db
 from gpustack.schemas.models import Model, ModelInstance
@@ -13,6 +15,11 @@ from gpustack.schemas.clusters import (
     Cluster,
 )
 from gpustack.schemas.workers import Worker
+from gpustack.schemas.links import (
+    ModelInstanceModelFileLink,
+    ModelInstanceDraftModelFileLink,
+)
+from gpustack.schemas.model_files import ModelFile
 
 
 logger = logging.getLogger(__name__)
@@ -49,6 +56,7 @@ async def init_db_engine(db_url: str):
 
 async def create_db_and_tables(engine: AsyncEngine):
     async with engine.begin() as conn:
+        await conn.run_sync(_upgrade_model_instance_columns)
         await conn.run_sync(
             SQLModel.metadata.create_all,
             tables=[
@@ -56,5 +64,26 @@ async def create_db_and_tables(engine: AsyncEngine):
                 ModelInstance.__table__,
                 Worker.__table__,
                 Cluster.__table__,
+                ModelFile.__table__,
+                ModelInstanceModelFileLink.__table__,
+                ModelInstanceDraftModelFileLink.__table__,
             ],
         )
+
+
+def _upgrade_model_instance_columns(connection):
+    """用来修改已经存在的数据库表"""
+    inspector = inspect(connection)
+    table = ModelInstance.__table__
+    if not inspector.has_table(table.name):
+        return
+    existing = {column["name"] for column in inspector.get_columns(table.name)}
+    additions = {
+        "draft_model_source", "draft_model_download_progress",
+        "draft_model_resolved_path", "distributed_servers",
+    }
+    table_name = connection.dialect.identifier_preparer.quote(table.name)
+    for column in table.columns:
+        if column.name in additions and column.name not in existing:
+            declaration = str(CreateColumn(column).compile(dialect=connection.dialect))
+            connection.exec_driver_sql(f"ALTER TABLE {table_name} ADD COLUMN {declaration}")

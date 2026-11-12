@@ -52,6 +52,12 @@ MODEL_INSTANCE_RESCHEDULE_GRACE_PERIOD = int(
 )  # 5 minutes in seconds
 
 
+DISABLE_OS_FILELOCK = os.getenv("GPUSTACK_DISABLE_OS_FILELOCK", "false").lower() in [
+    "true",
+    "1",
+]
+
+
 SCHEDULER_SCALE_UP_PLACEMENT_MAX_SCORE = float(
     os.getenv("GPUSTACK_SCHEDULER_SCALE_UP_PLACEMENT_MAX_SCORE", 100)
 )

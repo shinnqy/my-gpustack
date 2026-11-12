@@ -11,6 +11,11 @@ from gpustack.schemas.models import ModelCreate
 from gpustack.schemas.models import ModelPublic
 from gpustack.schemas.models import ModelUpdate
 from gpustack.schemas.models import ModelsPublic
+from gpustack.schemas.model_files import ModelFile
+from gpustack.schemas.model_files import ModelFileCreate
+from gpustack.schemas.model_files import ModelFilePublic
+from gpustack.schemas.model_files import ModelFileUpdate
+from gpustack.schemas.model_files import ModelFilesPublic
 
 
 

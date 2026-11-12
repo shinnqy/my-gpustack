@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy import event as sqlalchemy_event
 import uvicorn
 
 from gpustack.client import ClientSet
@@ -38,6 +39,9 @@ async def project_context(tmp_path, monkeypatch, database_file=False):
         if database_file else "sqlite+aiosqlite://"
     )
     engine = create_async_engine(database_url)
+    @sqlalchemy_event.listens_for(engine.sync_engine, "connect")
+    def enable_foreign_keys(connection, record):
+        connection.execute("PRAGMA foreign_keys=ON")
     monkeypatch.setattr(db, "engine", engine)
     await cache_module.cache.clear()
     cache_module._cache_locks.clear()

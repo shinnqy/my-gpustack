@@ -18,6 +18,8 @@ import logging
 from typing import Dict
 from gpustack.schemas.workers import GPUDevicesStatus
 from typing import Any
+from gpustack.schemas.model_files import ModelFileStateEnum
+from gpustack.server.services import ModelFileService
 
 
 logger = logging.getLogger(__name__)
@@ -184,6 +186,21 @@ async def _get_cached_model_size(
     """
     if not session:
         return None
+
+    """根据 model_source_index 查找文件记录，找到第一条 READY 且有 size 的记录，就返回其大小"""
+    source_index = model.model_source_index
+    if not source_index:
+        return None
+
+    model_files = await ModelFileService(session).get_by_source_index(source_index)
+    if not model_files:
+        return None
+
+    # Find READY files with size
+    for mf in model_files:
+        if mf.state == ModelFileStateEnum.READY and mf.size:
+            logger.info(f"Using cached size {mf.size} from ModelFile {mf.id}")
+            return mf.size
 
     return None
 

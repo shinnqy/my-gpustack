@@ -11,6 +11,7 @@ from gpustack.schemas.workers import Worker
 from gpustack.schemas.models import ModelInstanceStateEnum
 from gpustack.server.cache import delete_cache_by_key
 from gpustack.server.cache import locked_cached
+from gpustack.schemas.model_files import ModelFile
 
 
 logger = logging.getLogger(__name__)
@@ -158,3 +159,35 @@ class ModelInstanceService:
             raise InternalServerErrorException(
                 message=f"Failed to delete model instances {names}: {e}"
             )
+
+
+class ModelFileService:
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def get_by_resolved_path(self, path: str) -> List[ModelFile]:
+        """查找实际路径列表中包含该路径的文件记录，供本地路径复用使用"""
+
+        results = await ModelFile.all_by_fields(
+            self.session,
+        )
+        filtered_results = []
+        for result in results:
+            self.session.expunge(result)
+            if path in result.resolved_paths:
+                filtered_results.append(result)
+
+        return filtered_results
+
+    async def get_by_source_index(self, source_index: str) -> List[ModelFile]:
+        """查找同一模型来源的文件记录，供文件复用和大小查询使用"""
+
+        results = await ModelFile.all_by_field(
+            self.session, "source_index", source_index
+        )
+        if results is None:
+            return None
+
+        for result in results:
+            self.session.expunge(result)
+        return results

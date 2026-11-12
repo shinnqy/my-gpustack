@@ -22,6 +22,8 @@ logger = logging.getLogger(__name__)
 
 
 class ModelClient:
+    """操作模型部署配置：创建或修改模型来源、推理后端、期望副本数等。"""
+
     def __init__(self, client: HTTPClient, enable_cache: bool = True):
         self._client = client
         self._url = "/models"

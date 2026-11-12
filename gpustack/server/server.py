@@ -24,6 +24,7 @@ from gpustack.server.db import async_session
 from gpustack.config.registration import write_registration_token
 from gpustack.server.worker_status_buffer import flush_worker_status_to_db
 from gpustack.scheduler.scheduler import Scheduler
+from gpustack.server.controllers import ModelFileController
 
 
 logger = logging.getLogger(__name__)
@@ -94,13 +95,12 @@ class Server:
     def _start_controllers(self):
         """Start all controllers and return the list of tasks."""
         tasks = []
-
         model_controller = ModelController(self._config)
         tasks.append(asyncio.create_task(model_controller.start()))
-
         model_instance_controller = ModelInstanceController(self._config)
         tasks.append(asyncio.create_task(model_instance_controller.start()))
-
+        model_file_controller = ModelFileController()
+        tasks.append(asyncio.create_task(model_file_controller.start()))
         logger.debug("Controllers started.")
         return tasks
 

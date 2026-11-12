@@ -4,6 +4,7 @@ from typing import Optional
 from .generated_worker_client import WorkerClient
 from .generated_model_client import ModelClient
 from .generated_model_instance_client import ModelInstanceClient
+from .generated_model_file_client import ModelFileClient
 
 
 class ClientSet:
@@ -36,15 +37,23 @@ class ClientSet:
             .with_timeout(timeout)
         )
         self.http_client = http_client
+        # 查看有哪些节点、节点状态和 GPU 信息。
         self.workers = WorkerClient(
             http_client,
             enable_cache=enable_cache,
         )
+        # 创建或修改模型来源、推理后端、期望副本数等。
         self.models = ModelClient(
             http_client,
             enable_cache=enable_cache,
         )
+        # 监听副本分配到哪个 Worker，查询和回报实例状态。
         self.model_instances = ModelInstanceClient(
+            http_client,
+            enable_cache=enable_cache,
+        )
+        # 监听文件准备任务，回报下载进度、实际路径和成功／失败状态。
+        self.model_files = ModelFileClient(
             http_client,
             enable_cache=enable_cache,
         )

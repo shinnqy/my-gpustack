@@ -18,6 +18,8 @@ logger = logging.getLogger(__name__)
 
 
 class ModelInstanceClient:
+    """操作模型的具体副本：监听副本分配到哪个 Worker，查询和回报实例状态。"""
+
     def __init__(self, client: HTTPClient, enable_cache: bool = True):
         self._client = client
         self._url = "/model-instances"

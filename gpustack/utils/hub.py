@@ -21,6 +21,9 @@ from gpustack.schemas.models import CategoryEnum
 import logging
 from functools import cache
 from threading import Lock
+from gpustack.schemas import ModelFile
+from gpustack.schemas.models import get_mmproj_filename
+import fnmatch
 
 
 logger = logging.getLogger(__name__)
@@ -39,6 +42,139 @@ MODELSCOPE_CONFIG_ALLOW_FILE_PATTERN = [
 def get_model_lock(model_id: str) -> Lock:
     """同一进程内，同一模型共用一个线程锁，避免多个调度评估线程同时下载到同一个目录。进入锁后再次检查 config.json，防止重复下载"""
     return Lock()
+
+
+class FileEntry:
+    """	用统一结构表示文件的相对路径 rfilename 和大小 size"""
+
+    def __init__(self, rfilename: str, size: Optional[int] = None):
+        self.rfilename = rfilename
+        self.size = size
+
+
+def get_model_path_and_name(model: ModelFile) -> (str, str):
+    """根据来源，取出仓库 ID／本地路径，以及指定的文件名或匹配模式。"""
+
+    if model.source == SourceEnum.HUGGING_FACE:
+        return model.huggingface_repo_id, model.huggingface_filename
+    elif model.source == SourceEnum.MODEL_SCOPE:
+        return model.model_scope_model_id, model.model_scope_file_path
+    elif model.source == SourceEnum.LOCAL_PATH:
+        return model.local_path, ""
+    else:
+        return "", ""
+
+
+def match_file_and_calculate_size(
+    files: List[FileEntry],
+    model: ModelFile,
+    cache_dir: str,
+) -> (int, List[str]):
+    """
+    筛选目标文件，累计大小，并返回预期的本地路径。
+    """
+
+    selected_files = []
+    match_files = []
+    extra_files = []
+
+    file_path, filename = get_model_path_and_name(model)
+    extra_filename = get_mmproj_filename(model)
+
+    if model.source == SourceEnum.LOCAL_PATH:
+        return (
+            sum(f.size for f in files if f.size is not None),
+            [f.rfilename for f in files],
+        )
+
+    if file_path and not filename:
+        base_dir = model.local_dir or f"{cache_dir}/{model.source.value}/{file_path}"
+        return (
+            sum(f.size for f in files if getattr(f, 'size', None) is not None),
+            [base_dir],
+        )
+
+    for sibling in files:
+        if sibling.size is None:
+            continue
+
+        rfilename = sibling.rfilename
+
+        if filename and fnmatch.fnmatch(rfilename, filename):
+            selected_files.append(rfilename)
+            match_files.append(sibling)
+        elif extra_filename and fnmatch.fnmatch(rfilename, extra_filename):
+            extra_files.append(rfilename)
+            match_files.append(sibling)
+
+    best_extra = select_most_suitable_extra_file(extra_files)
+    if best_extra:
+        selected_files.append(best_extra)
+
+    sum_size = sum(
+        f.size
+        for f in match_files
+        if getattr(f, 'rfilename', '') in selected_files
+        and getattr(f, 'size', None) is not None
+    )
+
+    if selected_files and model.source in [
+        SourceEnum.HUGGING_FACE,
+        SourceEnum.MODEL_SCOPE,
+    ]:
+        base_dir = model.local_dir or f"{cache_dir}/{model.source.value}/{file_path}"
+        selected_files = [os.path.join(base_dir, f) for f in selected_files]
+
+    return sum_size, selected_files
+
+
+def select_most_suitable_extra_file(file_list: List[str]) -> str:
+    """
+    多个附加文件匹配时，按文件名倒序取第一个；注释以 f32 优先于 f16 为例。
+    """
+    if not file_list or len(file_list) == 0:
+        return ""
+    _file_list = sorted(file_list, reverse=True)
+    return _file_list[0]
+
+
+def match_hugging_face_files(
+    repo_id: str,
+    filename: str,
+    extra_filename: Optional[str] = None,
+    token: Optional[str] = None,
+) -> List[str]:
+    """递归列出 Hugging Face 仓库文件，用通配符匹配主文件和可选的 mmproj 文件"""
+
+    validate_repo_id(repo_id)
+
+    hffs = HfFileSystem(token=token)
+
+    files = [
+        file["name"] if isinstance(file, dict) else file
+        for file in hffs.ls(repo_id, recursive=True)
+        if not isinstance(file, dict) or file.get("type") == "file"
+    ]
+
+    file_list: List[str] = []
+    for file in files:
+        rel_path = Path(file).relative_to(repo_id)
+        file_list.append(rel_path.as_posix())
+
+    matching_files = [file for file in file_list if fnmatch.fnmatch(file, filename)]  # type: ignore
+    matching_files = sorted(matching_files)
+
+    if extra_filename is None:
+        return matching_files
+
+    extra_matching_files = [
+        file for file in file_list if fnmatch.fnmatch(file, extra_filename)
+    ]
+    extra_file = select_most_suitable_extra_file(extra_matching_files)
+    if extra_file:
+        matching_files.append(extra_file)
+
+    return matching_files
 
 
 def list_repo(
@@ -100,6 +236,39 @@ def list_repo(
         logger.info(f"Saved cache {LIST_REPO_CACHE_DIR} {cache_key} fail")
 
     return file_info
+
+
+def match_model_scope_file_paths(
+    model_id: str, file_path: str, extra_file_path: Optional[str] = None
+) -> List[str]:
+    """对 ModelScope 做同样的匹配，返回准备下载的相对路径列表"""
+
+    api = HubApi()
+
+    if extra_file_path is None:
+        # Fast path: scope listing to the main file's directory.
+        if '/' in file_path:
+            root, _ = file_path.rsplit('/', 1)
+        else:
+            root = None
+        files = api.get_model_files(model_id, root=root, recursive=True)
+        file_paths = [f["Path"] for f in files]
+        return sorted(p for p in file_paths if fnmatch.fnmatch(p, file_path))
+
+    # List the whole repo so a root-level mmproj is reachable when the
+    # main weights live in a subfolder.
+    files = api.get_model_files(model_id, recursive=True)
+    file_paths = [f["Path"] for f in files]
+    matching_paths = sorted(p for p in file_paths if fnmatch.fnmatch(p, file_path))
+
+    extra_matching_paths = [
+        p for p in file_paths if fnmatch.fnmatch(p, extra_file_path)
+    ]
+    extra_file = select_most_suitable_extra_file(extra_matching_paths)
+    if extra_file:
+        matching_paths.append(extra_file)
+
+    return matching_paths
 
 
 def read_repo_file_content(  # noqa: C901

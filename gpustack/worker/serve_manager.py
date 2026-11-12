@@ -9,6 +9,11 @@ import logging
 from typing import Dict
 from typing import Set
 import time
+from gpustack.schemas.models import ModelInstanceStateEnum
+from gpustack.api.exceptions import NotFoundException
+from gpustack.schemas.models import ModelInstanceUpdate
+from gpustack.utils.attrs import set_attr
+from gpustack.server.bus import EventType
 
 
 logger = logging.getLogger(__name__)
@@ -122,5 +127,50 @@ class ServeManager:
         )
 
         is_main_worker = mi.worker_id == self._worker_id
-        if is_main_worker:
-            logger.info(f"Model instance {mi.name} is assigned to me, state: {mi.state}")
+        if not is_main_worker:
+            return
+
+        """
+        判断该不该接手实例，要求同时满足：
+            - 实例的主 Worker 是当前 Worker。
+            - 事件是 CREATED 或 UPDATED。
+            - 实例状态为 SCHEDULED。
+        """
+        if event.type in {EventType.CREATED, EventType.UPDATED}:
+            # Restart if scheduled and this is the assigned worker.
+            if is_main_worker and mi.state == ModelInstanceStateEnum.SCHEDULED:
+                self._start_model_instance(mi)
+            return
+
+    def _start_model_instance(self, mi: ModelInstance):
+        """向 Server 确认开始初始化"""
+        # 阶段版：只把实例改成 INITIALIZING，触发 Server 端准备模型文件。
+        # 第 11 章换成真实版本：起一个子进程，等实例进入 STARTING 后创建容器。
+        self._update_model_instance(mi.id, state=ModelInstanceStateEnum.INITIALIZING)
+        logger.info(f"Started model instance {mi.name}")
+
+    def _update_model_instance(self, id: int, **kwargs):
+        """
+        封装通过 API 更新实例的过程
+
+        Args:
+            id: The ID of the model instance to update.
+            **kwargs: The fields to update, group by field name and value.
+        """
+
+        try:
+            # 获取 Server 上的实例数据
+            mi_public = self._clientset.model_instances.get(id=id)
+
+            # 转成更新请求对象
+            mi = ModelInstanceUpdate(**mi_public.model_dump())
+            # 应用本次修改，例如 state=INITIALIZING
+            for key, value in kwargs.items():
+                set_attr(mi, key, value)
+
+            # 发给 Server 保存
+            self._clientset.model_instances.update(id=id, model_update=mi)
+        except NotFoundException:
+            logger.warning(
+                f"Model instance with ID {id} not found when trying to update."
+            )

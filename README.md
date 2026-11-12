@@ -1,12 +1,14 @@
-# My GPUStack：第九章完成版
+# My GPUStack：第十章完成版
 
-按 `guide/v1/01`～`09` 的正文及配套辅助代码整理。
+按 `guide/v1/01`～`10` 的正文及配套辅助代码整理。
 已具备集群、模型与实例记录、事件控制器，以及 Worker 注册、设备采集、心跳和状态批量上报。
 已接通模型和实例的 Watch 流、Worker 客户端缓存、ServeManager 订阅骨架，以及 Server 快照缓存和写入后的缓存失效。
 已接通调度器、去重队列、集群/GPU 所在 Worker/标签/就绪状态过滤，以及调度结果回写。
-有匹配的设备时，实例从 `pending` 经 `analyzing` 推进到 `scheduled`，Worker 收到分配事件并记录日志。
+有匹配的设备时，实例从 `pending` 经 `analyzing` 推进到 `scheduled`，Worker 接手后继续准备模型文件。
 新增模型配置与分类识别、权重大小估算、显存分配账本、vLLM 单卡/单机多卡匹配、
-Spread/Binpack 放置评分，以及缩容评分链。模型文件下载和推理进程在后续章节接入。
+Spread/Binpack 放置评分，以及缩容评分链。
+新增 ModelFile 记录与关联、文件控制器、进程池下载、进度与错误同步、同机文件复用和缓存清理。
+文件准备完成后实例进入 `starting`；推理容器在第十一章接入。
 
 ## 安装与启动
 
@@ -97,6 +99,7 @@ for item in json.load(sys.stdin)["items"]:
 
 成功时应为 `scheduled`，包含 Worker 名称和卡号，`state_message` 为空。
 Worker 的 ServeManager 日志会记录该实例已分配给自己。
+在第十章，Worker 会立即接手准备文件，查询时可能已经进入 `initializing`、`downloading` 或 `starting`。
 
 调度器有三条入口：启动时扫描待调度实例、订阅新的 `CREATED` 事件、每 180 秒扫描重试。
 评估后通过一个消费者串行放置，同一个实例的不同快照按实例 ID 去重。
@@ -155,7 +158,61 @@ curl -s -X POST http://127.0.0.1:30080/v2/models \
 
 `computed_resource_claim.vram` 是调度预算。模型权重大小仍是经验估算，
 获取仓库大小失败时会退回框架开销；需要确定的预算时，可使用 `GPUSTACK_MODEL_VRAM_CLAIM`。
-当前 Worker 收到分配后仍只记录日志，不会启动推理容器。
+当前 Worker 收到分配后会准备模型文件，在 `starting` 等待第十一章接入推理容器。
+
+## 第十章检查点
+
+先执行 `uv sync` 并重启 Server 和 Worker。
+Server 启动时会为第九章的旧实例表补齐四个可空字段，并创建模型文件与两张关联表，保留已有模型和实例数据。
+新建的 `source_index` 是普通索引，同一来源可以在不同 Worker 上有独立文件记录。
+
+Worker 需要能够访问下载源，并能写入自己的缓存目录。默认下载位置为：
+
+- Hugging Face：`<worker-cache-dir>/huggingface/<组织>/<仓库>`。
+- ModelScope：`<worker-cache-dir>/model_scope/<组织>/<仓库>`。
+- 本地路径：直接使用 Worker 上已有的路径，不复制文件；当前资源匹配还要求 Server 能读取模型配置。
+
+创建一个资源能放下的小模型：
+
+```bash
+curl -s -X POST http://127.0.0.1:30080/v2/models \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"files-demo","source":"huggingface","huggingface_repo_id":"Qwen/Qwen3-0.6B","backend_parameters":["--gpu-memory-utilization=0.4"]}'
+```
+
+在另一个终端观察实例事件：
+
+```bash
+curl -N 'http://127.0.0.1:30080/v2/model-instances?watch=true'
+```
+
+另外查询文件记录：
+
+```bash
+curl -s 'http://127.0.0.1:30080/v2/model-files' | python -m json.tool
+```
+
+完整状态链为 `scheduled → initializing → downloading → starting`。
+文件就绪后，实例的 `download_progress` 为 100，`resolved_path` 指向 Worker 上的实际模型路径。
+下载文件的记录包含 `size`、`resolved_paths` 和 `state=ready`；进度在下载收尾前最多显示 99%。
+
+同一 Worker 上的同一来源只需要一份 ModelFile，多个实例通过关联表复用它。
+将模型副本数改为 2 时，资源预算允许的情况下，第二个实例复用已有文件；已就绪的文件会直接推进实例到 `starting`。
+两台 Worker 则分别维护各自的文件记录。
+
+文件下载出错时，ModelFile 和关联实例都会进入 `error`。
+让实例重新经过 `initializing` 会重置出错文件并重新提交下载；自动错误重启属于第十二章。
+Worker 的文件 Watch 断线后会重连，停止时会取消下载并关闭下载进程池和跨进程管理器。
+
+删除模型或缩容会解除实例与文件的关联，保留缓存供后续复用。
+文件仍被主模型或草稿模型引用时，删除接口返回 409。
+确认文件不再使用后，可以按文件 ID 删除记录，并请求 Worker 清理磁盘缓存：
+
+```bash
+curl -X DELETE 'http://127.0.0.1:30080/v2/model-files/FILE_ID?cleanup=true'
+```
+
+省略 `cleanup=true` 时保留磁盘文件。实例到达 `starting` 表示文件准备完成，本阶段尚不启动推理进程。
 
 ## 本地验证
 
@@ -170,5 +227,8 @@ uv run --python 3.12 --isolated pytest -q
 旧任务保护、失败后解除旧绑定，以及调度器停止时清理消费者和定时任务。
 资源匹配测试覆盖显存预留与扣减、统一内存、异构卡分组、GMU 边界、单卡/多卡、
 手动选卡、TP 整除、模型分类、重调度释放自身预留、放置评分和缩容顺序。
+模型文件测试覆盖共享和多 Worker 记录、提交关联后发布事件、进度汇总、草稿文件、
+下载失败与重试、缓存清理、下载取消、文件锁、进程池资源关闭，以及保留数据的旧库升级。
+进程验证使用小型 HTTP 测试仓库、真实进程池和模拟 NPU，验证下载字节、文件复用及 `starting` 状态。
 生产启动仍使用 PostgreSQL；真实 GPU/NPU 驱动采集需要在对应机器上验证。
 Worker 停止后，本章不会自动重算离线状态；定期失联检查在第十二章实现。

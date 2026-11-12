@@ -22,6 +22,8 @@ logger = logging.getLogger(__name__)
 
 
 class WorkerClient:
+    """操作 worker 节点记录：查看有哪些节点、节点状态和 GPU 信息。"""
+
     def __init__(self, client: HTTPClient, enable_cache: bool = True):
         self._client = client
         self._url = "/workers"

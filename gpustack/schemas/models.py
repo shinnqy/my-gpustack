@@ -15,6 +15,15 @@ from gpustack.schemas.common import (
 )
 from gpustack.mixins import BaseModelMixin
 from pydantic import model_validator
+import hashlib
+from typing import TYPE_CHECKING
+from gpustack.schemas.links import ModelInstanceModelFileLink
+from sqlalchemy.orm import selectinload
+from sqlmodel import select
+from gpustack.schemas.links import ModelInstanceDraftModelFileLink
+from gpustack.utils.command import find_parameter
+from pathlib import Path
+from typing import Union
 
 
 class SourceEnum(str, Enum):
@@ -98,6 +107,27 @@ class ModelSource(BaseModel):
                     "local_path must be provided when source is 'local_path'"
                 )
         return self
+
+    @property
+    def model_source_index(self) -> str:
+        """
+        给模型来源生成标识
+            - 将仓库 ID、文件名或本地路径拼接后计算 SHA-256，用来查找已有的 ModelFile，方便复用下载记录
+        """
+        values = []
+        if self.source == SourceEnum.HUGGING_FACE:
+            values.extend([self.huggingface_repo_id, self.huggingface_filename])
+        elif self.source == SourceEnum.MODEL_SCOPE:
+            values.extend(
+                [self.source, self.model_scope_model_id, self.model_scope_file_path]
+            )
+        elif self.source == SourceEnum.LOCAL_PATH:
+            values.extend([self.local_path])
+
+        # Filter out None values and join
+        filtered_values = [v for v in values if v is not None]
+        source_string = "/".join(filtered_values)
+        return hashlib.sha256(source_string.encode()).hexdigest()
 
 
 class ModelSpecBase(SQLModel, ModelSource):
@@ -218,6 +248,58 @@ class ComputedResourceClaim(BaseModel):
     vram_utilization: Optional[float] = Field(default=None)
 
 
+class ModelInstanceSubordinateWorker(BaseModel):
+    """保存每个从属 Worker 的 GPU、资源需求、下载进度、进程、端口和状态"""
+
+    worker_id: Optional[int] = None
+    worker_name: Optional[str] = None
+    worker_ip: Optional[str] = None
+    worker_ifname: Optional[str] = None
+    total_gpus: Optional[int] = None
+    gpu_type: Optional[str] = None
+    gpu_indexes: Optional[List[int]] = Field(sa_column=Column(JSON), default=[])
+    gpu_addresses: Optional[List[str]] = Field(sa_column=Column(JSON), default=[])
+    computed_resource_claim: Optional[ComputedResourceClaim] = Field(
+        sa_column=Column(pydantic_column_type(ComputedResourceClaim)), default=None
+    )
+    # - For model file preparation
+    download_progress: Optional[float] = None
+    # - For model instance serving preparation
+    pid: Optional[int] = None
+    ports: Optional[List[int]] = Field(sa_column=Column(JSON), default=[])
+    arguments: Optional[List[str]] = Field(sa_column=Column(JSON), default=[])
+    state: ModelInstanceStateEnum = ModelInstanceStateEnum.PENDING
+    state_message: Optional[str] = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+
+
+class DistributedServerCoordinateModeEnum(Enum):
+    # DELEGATED means that the subordinate workers' coordinate is by-pass to other framework.
+    DELEGATED = "delegated"
+    # INITIALIZE_LATER means that the subordinate workers' coordinate is handled by GPUStack,
+    # all subordinate workers belong to one model instance SHOULD start after the main worker initializes.
+    # For example, Ascend MindIE/vLLM/SGLang instances need to start their subordinate workers after the main worker initializes.
+    INITIALIZE_LATER = "initialize_later"
+    # RUN_FIRST means that the subordinate workers' coordinate is handled by GPUStack,
+    # all subordinate workers belong to one model instance MUST get ready before the main worker starts.
+    RUN_FIRST = "run_first"
+
+
+class DistributedServers(BaseModel):
+    """把这些从属 Worker 汇总起来，存入实例的 distributed_servers JSON 列"""
+    # Indicates how the distributed servers coordinate with the main worker.
+    mode: DistributedServerCoordinateModeEnum = (
+        DistributedServerCoordinateModeEnum.DELEGATED
+    )
+    # Indicates if subordinate workers should download model files.
+    download_model_files: Optional[bool] = True
+    subordinate_workers: Optional[List[ModelInstanceSubordinateWorker]] = Field(
+        sa_column=Column(JSON), default=[]
+    )
+    model_config = ConfigDict(from_attributes=True)
+
+
 class ModelInstanceBase(SQLModel, ModelSource):
     name: str = Field(index=True, unique=True)
 
@@ -240,6 +322,17 @@ class ModelInstanceBase(SQLModel, ModelSource):
     download_progress: Optional[float] = None
 
     resolved_path: Optional[str] = None
+
+    # 单独记录草稿模型的准备状态 - 新增来源
+    draft_model_source: Optional[ModelSource] = Field(
+        sa_column=Column(pydantic_column_type(ModelSource)), default=None
+    )
+
+    # 单独记录草稿模型的准备状态 - 下载进度
+    draft_model_download_progress: Optional[float] = None
+
+    # 单独记录草稿模型的准备状态 - 本地实际路径
+    draft_model_resolved_path: Optional[str] = None
 
     restart_count: Optional[int] = 0
 
@@ -271,13 +364,23 @@ class ModelInstanceBase(SQLModel, ModelSource):
 
     backend_version: Optional[str] = None
 
+    """这里的 server 指参与推理的服务进程，不是管理 Worker 的 GPUStack Server"""
+    distributed_servers: Optional[DistributedServers] = Field(
+        sa_column=Column(pydantic_column_type(DistributedServers)), default=None
+    )
+
     model_config = ConfigDict(protected_namespaces=())
 
     cluster_id: Optional[int] = Field(default=None, foreign_key="clusters.id")
 
 
 class ModelInstance(ModelInstanceBase, BaseModelMixin, table=True):
+    """
+    表示“一个完整的模型服务副本”，这个副本可以由多个 Worker 共同运行
+    """
+
     __tablename__ = 'model_instances'
+
     id: Optional[int] = Field(default=None, primary_key=True)
 
     model: Optional[Model] = Relationship(
@@ -285,7 +388,42 @@ class ModelInstance(ModelInstanceBase, BaseModelMixin, table=True):
         sa_relationship_kwargs={"lazy": "noload"},
     )
 
-    # overwrite the hash to use in uniquequeue
+    """让实例关联模型文件"""
+    model_files: List["ModelFile"] = Relationship(
+        back_populates="instances",
+        link_model=ModelInstanceModelFileLink,
+        sa_relationship_kwargs={"lazy": "noload"},
+    )
+
+    draft_model_files: List["ModelFile"] = Relationship(
+        back_populates="draft_instances",
+        link_model=ModelInstanceDraftModelFileLink,
+        sa_relationship_kwargs={"lazy": "noload"},
+    )
+
+    @classmethod
+    async def one_by_id_with_model_files(
+        cls,
+        session,
+        instance_id: int,
+        populate_existing: bool = True,
+    ) -> Optional["ModelInstance"]:
+        """
+        提供显式加载关联数据的方法
+        """
+        stmt = (
+            select(cls)
+            .where(cls.id == instance_id)
+            .options(
+                selectinload(cls.model_files),
+                selectinload(cls.draft_model_files),
+                selectinload(cls.model),
+            )
+        )
+        if populate_existing:
+            stmt = stmt.execution_options(populate_existing=True)
+        return (await session.exec(stmt)).first()
+
     def __hash__(self):
         return self.id
 
@@ -307,6 +445,29 @@ class ModelInstancePublic(
 
 
 ModelInstancesPublic = PaginatedList[ModelInstancePublic]
+
+
+def is_gguf_model(model: Union[Model, ModelSource]):
+    """
+    根据文件名是否以 .gguf 结尾判断格式
+    """
+    return (
+        (
+            model.source == SourceEnum.HUGGING_FACE
+            and model.huggingface_filename
+            and model.huggingface_filename.endswith(".gguf")
+        )
+        or (
+            model.source == SourceEnum.MODEL_SCOPE
+            and model.model_scope_file_path
+            and model.model_scope_file_path.endswith(".gguf")
+        )
+        or (
+            model.source == SourceEnum.LOCAL_PATH
+            and model.local_path
+            and model.local_path.endswith(".gguf")
+        )
+    )
 
 
 def is_audio_model(model: Model):
@@ -340,3 +501,22 @@ def get_backend(model: Model) -> str:
         return model.backend
 
     return BackendEnum.VLLM
+
+
+def get_mmproj_filename(model: Union[Model, ModelSource]) -> Optional[str]:
+    """
+    帮下载器寻找多模态投影文件
+    """
+    if not is_gguf_model(model):
+        return None
+
+    if hasattr(model, "backend_parameters"):
+        mmproj = find_parameter(model.backend_parameters, ["mmproj"])
+        if mmproj and Path(mmproj).name == mmproj:
+            return mmproj
+
+    return "*mmproj*.gguf"
+
+
+if TYPE_CHECKING:
+    from gpustack.schemas.model_files import ModelFile

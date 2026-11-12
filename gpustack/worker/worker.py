@@ -27,6 +27,7 @@ from typing import Tuple
 from urllib.parse import urlparse
 from gpustack.utils.uuid import get_worker_name
 from gpustack.worker.serve_manager import ServeManager
+from gpustack.worker.model_file_manager import ModelFileManager
 
 
 logger = logging.getLogger(__name__)
@@ -153,6 +154,10 @@ class Worker:
         self._create_async_task(self._serve_apis())
         self._create_async_task(self._serve_manager.watch_models())
         self._create_async_task(self._serve_manager.watch_model_instances_event())
+        model_file_manager = ModelFileManager(
+            worker_id=self._worker_id, clientset=self._clientset, cfg=self._config
+        )
+        self._create_async_task(model_file_manager.watch_model_files())
         await asyncio.sleep(0.5)
         logger.info("GPUStack worker startup completed.")
         await asyncio.gather(*self._async_tasks)

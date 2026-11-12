@@ -26,6 +26,8 @@ dependencies = [
     "huggingface-hub>=1.0.0,<2",
     "modelscope>=1.28,<2",
     "transformers>=4.51.3,!=4.57.0,<6",
+    "filelock>=3.16",
+    "tqdm>=4.66.5",
 ]
 
 [dependency-groups]
