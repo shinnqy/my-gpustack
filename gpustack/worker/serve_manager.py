@@ -1001,6 +1001,27 @@ class ServeManager:
                 # Reset failure count on success.
                 self._inference_health_check_failures.pop(model_instance.id, None)
 
+    def record_successful_inference(self, instance_id: int):
+        """
+        记录实例最近一次成功推理的时间
+        """
+        self._last_successful_inference[instance_id] = time.time()
+
+    def get_instance_port_by_model_instance_id(
+        self, model_instance_id: int
+    ) -> Optional[int]:
+        """
+        根据实例 ID 查询本地缓存，只有实例处于 RUNNING 才返回端口；优先使用 ports[0]，否则使用 port。
+
+        Worker 代理靠它找到实际推理引擎
+        """
+        instance = self._model_instance_by_instance_id.get(
+            model_instance_id
+        )  # Ensure the model instance is cached.
+        if not instance or instance.state != ModelInstanceStateEnum.RUNNING:
+            return None
+        return instance.ports[0] if instance.ports else instance.port
+
 
 def is_ready(
     backend: str,

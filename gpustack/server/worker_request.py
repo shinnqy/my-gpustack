@@ -10,6 +10,9 @@ from typing import Dict
 from typing import Literal
 from typing import Union
 import logging
+from typing import Tuple
+from typing import AsyncGenerator
+from typing import Callable
 
 
 logger = logging.getLogger(__name__)
@@ -71,9 +74,8 @@ def _build_url(worker: Worker, path: str) -> str:
 def _convert_params(params: Optional[Dict]) -> Optional[Dict]:
     """Convert bool params to str for aiohttp compatibility."""
     if params:
-        return {
-            k: str(v).lower() if isinstance(v, bool) else v for k, v in params.items()
-        }
+        items = params.items() if hasattr(params, "items") else params
+        return [(key, str(value).lower() if isinstance(value, bool) else value) for key, value in items]
     return params
 
 
@@ -111,9 +113,11 @@ async def _request_to_worker(
             f"No http client available: proxy_client={proxy_client}, no_proxy_client={no_proxy_client}"
         )
 
-    req_headers = {"Authorization": f"Bearer {worker.token}"}
-    if headers:
-        req_headers.update(headers)
+    """
+    先移除传入的 Authorization，再写入目标 Worker 的 Token。客户端携带的认证信息不会覆盖 Server → Worker 这一跳的身份
+    """
+    req_headers = {key: value for key, value in (headers or {}).items() if key.lower() != "authorization"}
+    req_headers["Authorization"] = f"Bearer {worker.token}"
 
     if timeout is None:
         timeout = aiohttp.ClientTimeout(total=_TIMEOUT, sock_connect=5)
@@ -143,3 +147,144 @@ async def _request_to_worker(
     finally:
         if resp is not None:
             resp.close()
+
+
+async def request_to_worker(
+    worker: Worker,
+    method: Literal["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
+    path: str,
+    proxy_client: Optional[aiohttp.ClientSession] = None,
+    no_proxy_client: Optional[aiohttp.ClientSession] = None,
+    params: Optional[Dict] = None,
+    data: Optional[Union[bytes, AsyncIterator[bytes], aiohttp.FormData]] = None,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: Optional[aiohttp.ClientTimeout] = None,
+    raise_on_error: bool = True,
+) -> Tuple[aiohttp.ClientResponse, Optional[bytes]]:
+    """
+    发送请求到 worker
+
+    读完整个响应体后返回“响应元信息 + 原始字节”，供普通 JSON、音频等响应使用
+    """
+    async with _request_to_worker(
+        worker=worker,
+        method=method,
+        path=path,
+        proxy_client=proxy_client,
+        no_proxy_client=no_proxy_client,
+        params=params,
+        data=data,
+        headers=headers,
+        timeout=timeout,
+        raise_on_error=raise_on_error,
+    ) as resp:
+        body = await resp.read()
+        return resp, body if body else None
+
+
+def _process_stream_line(line_bytes: bytes) -> str:
+    """Process a line of bytes to ensure it is properly formatted for streaming."""
+    line = line_bytes.decode("utf-8").strip()
+    return line + "\n\n" if line else ""
+
+
+async def _stream_response_chunks(
+    resp: aiohttp.ClientResponse,
+) -> AsyncGenerator[str, None]:
+    """
+    提供按行整理 SSE 的模式
+    """
+
+    chunk_size = 4096  # 4KB
+    chunk_buffer = b""
+    async for data in resp.content.iter_chunked(chunk_size):
+        lines = (chunk_buffer + data).split(b'\n')
+        chunk_buffer = lines.pop(-1)
+
+        for line_bytes in lines:
+            if line_bytes:
+                yield _process_stream_line(line_bytes)
+
+    if chunk_buffer:
+        yield _process_stream_line(chunk_buffer)
+
+
+async def stream_to_worker(
+    worker: Worker,
+    method: Literal["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
+    path: str,
+    proxy_client: Optional[aiohttp.ClientSession] = None,
+    no_proxy_client: Optional[aiohttp.ClientSession] = None,
+    params: Optional[Dict] = None,
+    data: Optional[Union[bytes, AsyncIterator[bytes], aiohttp.FormData]] = None,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: Optional[aiohttp.ClientTimeout] = None,
+    on_exception: Optional[
+        Callable[[Exception, aiohttp.ClientTimeout], Tuple[str, int]]
+    ] = None,
+    raw: bool = False,
+) -> AsyncGenerator[Tuple[Union[bytes, str], dict, int], None]:
+    """
+    Stream a request to a worker and yield response chunks.
+
+    Yields tuples of (chunk, headers, status).
+
+    Automatically handles:
+    - URL construction (advertise_address or ip + port)
+    - Proxy selection (based on use_proxy_env_for_url)
+    - Authorization header
+
+    Args:
+        worker: Target worker
+        method: HTTP method
+        path: API path
+        proxy_client: HTTP client with proxy
+        no_proxy_client: HTTP client without proxy
+        params: Query parameters
+        data: Bytes, async iterator of bytes, or FormData
+        headers: Additional headers
+        timeout: Request timeout
+        on_exception: Optional callback(exception, timeout) -> (error_msg, status_code).
+            Called when an exception occurs during streaming. If not provided,
+            the exception is raised.
+        raw: If True, yield raw bytes without SSE line formatting (use for log streams).
+            If False (default), format each line as SSE (use for OpenAI-compatible streams).
+    """
+    try:
+        async with _request_to_worker(
+            worker=worker,
+            method=method,
+            path=path,
+            proxy_client=proxy_client,
+            no_proxy_client=no_proxy_client,
+            params=params,
+            data=data,
+            headers=headers,
+            timeout=timeout,
+            raise_on_error=False,
+        ) as resp:
+            if resp.status >= 400:
+                body = await resp.read()
+                yield body, resp.headers, resp.status
+                return
+
+            yielded = False
+            if raw:
+                async for chunk in resp.content.iter_any():
+                    yielded = True
+                    yield chunk, resp.headers, resp.status
+            else:
+                async for chunk in _stream_response_chunks(resp):
+                    yielded = True
+                    yield chunk, resp.headers, resp.status
+            if not yielded:
+                yield b"", resp.headers, resp.status
+    except Exception as e:
+        logger.error(
+            f"Worker stream failed: {worker.id} {method} {path}: {e}", exc_info=True
+        )
+        if on_exception is not None:
+            error_msg, status_code = on_exception(e, timeout)
+            yield error_msg, {}, status_code
+        else:
+            raise

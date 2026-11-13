@@ -31,6 +31,8 @@ dependencies = [
     "gpustack-runner==0.1.27.post4",
     "requests>=2.32.3",
     "packaging>=24.1",
+    "openai>=1.31.1",
+    "python-multipart>=0.0.17",
 ]
 
 [dependency-groups]

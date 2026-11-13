@@ -1,6 +1,6 @@
-# My GPUStack：第十二章完成版
+# My GPUStack：第十三章完成版
 
-按 `guide/v1/01`～`12` 的正文及配套辅助代码整理。
+按 `guide/v1/01`～`13` 的正文及配套辅助代码整理。
 已具备集群、模型与实例记录、事件控制器，以及 Worker 注册、设备采集、心跳和状态批量上报。
 已接通模型和实例的 Watch 流、Worker 客户端缓存、ServeManager 订阅骨架，以及 Server 快照缓存和写入后的缓存失效。
 已接通调度器、去重队列、集群/GPU 所在 Worker/标签/就绪状态过滤，以及调度结果回写。
@@ -12,6 +12,8 @@ Spread/Binpack 放置评分，以及缩容评分链。
 已接通推理就绪检查、运行状态同步、错误重启与指数退避、删除后的容器收割，
 以及 Worker 失联检测、维护模式和离线实例清理。
 文件准备完成后，启动子进程创建推理容器并结束初始化；容器运行且就绪检查通过后，实例进入 `running`。
+已接通按模型名选择实例的 OpenAI 兼容接口、轮询负载均衡、Server 到 Worker 再到推理引擎的两跳代理，
+支持普通 JSON、SSE 流式响应、二进制响应和表单文件上传。
 
 ## 安装与启动
 
@@ -269,7 +271,7 @@ curl http://WORKER_IP:INSTANCE_PORT/v1/chat/completions \
 
 启动日志在 `<worker-data-dir>/log/serve/<实例ID>.<重启次数>.log`，例如 `1.0.log`。
 第十二章已接通自动置为 `running`、错误重启和删除后的容器清理，检查方法见下文。
-GPUStack 入口 `/v1/chat/completions` 的代理在第十三章接入。
+GPUStack 入口 `/v1/chat/completions` 的代理已接通，检查方法见第十三章。
 
 ## 第十二章检查点
 
@@ -331,6 +333,57 @@ curl -s -X PUT http://127.0.0.1:30080/v2/workers/WORKER_ID \
 对应的 `GPUSTACK_MODEL_INFERENCE_HEALTH_CHECK_INTERVAL`、`_TIMEOUT` 和 `_FAILURE_THRESHOLD`
 可分别覆盖这些值。推理检查也走前述错误恢复流程。
 
+## 第十三章检查点
+
+执行 `uv sync` 后，用上文的命令分别启动 Server 和 Worker。
+Worker 的固定 API 端口（默认 10150）需能被 Server 访问。
+通过 ModelScope 创建一个能放入设备的小模型：
+
+```bash
+curl -s -X POST http://127.0.0.1:30080/v2/models \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"proxy-demo","source":"model_scope","model_scope_model_id":"Qwen/Qwen3-0.6B"}'
+```
+
+等实例进入 `running` 后，在能访问 Server 的机器上执行：
+
+```bash
+curl -s http://127.0.0.1:30080/v1/models
+curl http://127.0.0.1:30080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"proxy-demo","messages":[{"role":"user","content":"你好"}]}'
+curl -N http://127.0.0.1:30080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"proxy-demo","stream":true,"messages":[{"role":"user","content":"数到十"}]}'
+```
+
+`/v1/models` 只列出已有就绪副本的模型。流式请求应逐步返回 `data: ...`，
+最后携带 token 用量并以 `data: [DONE]` 结束；引擎需支持相应的响应格式。
+表单上传、重复表单字段、二进制响应、引擎错误状态码和多值响应头均可经过代理。
+流式连接断开时关闭上游连接；请求转发开始前释放数据库会话。
+
+也可运行教材的 OpenAI SDK 检查脚本：
+
+```bash
+uv run python tests/test_openai_client.py \
+  --base-url http://127.0.0.1:30080/v1 --model proxy-demo
+```
+
+本章 Server 按模型名直接查找模型，省略用户/API Key 权限检查，因此 SDK 示例使用 `api_key="unused"`。
+Server 会把请求中的用户 Authorization 替换为 Worker 专属令牌，并添加实例路由头；
+Worker 验证令牌后，只向本机 `running` 实例转发，记录成功请求供主动健康检查使用。
+
+资源允许时把副本数改为 2，连续发送 4 次请求，应在两个实例间轮询。
+实例离开 `running` 后，其查询缓存失效，后续请求使用剩余就绪实例。
+不存在的模型返回 OpenAI 格式 404；副本数为 0 或全部实例未就绪时返回 503。
+直接请求 Worker 推理接口且不带令牌时返回 401。
+上游返回 4xx/5xx 时保留状态和正文；连接失败返回 503，超时返回 504。
+流式响应已经开始后发生故障时，通过 SSE 错误事件报告，不再次发送 HTTP 响应头。
+
+`/v1-openai` 保留教材列出的旧路径子集，转给引擎时统一使用 `/v1`。
+当前实现的是 `worker` 两跳模式；`direct`、`tunnel`、Higress 网关和专用 `/rerank` 路由不在本章范围。
+具体模型是否支持音频、图像等接口，由其推理引擎决定。
+
 ## 本地验证
 
 ```bash
@@ -354,4 +407,9 @@ uv run --python 3.12 --isolated pytest -q
 可选主动推理检查、心跳恢复、维护接口、集群隔离、离线实例重建、孤儿清理及保留数据的 Worker 表升级。
 第十二章独立 Server/Worker 进程检查使用临时 SQLite、模拟 Runtime 和本地 HTTP 推理替身，
 验证就绪、故障重启、Worker 失联与重连、复用原工作负载，以及删除模型后的进程清理。
+推理代理测试使用真实本地 HTTP 连接，覆盖两跳轮询、旧路径、认证与请求头替换、
+OpenAI 错误格式、状态码透传、超时、重复响应头、自动解压、二进制和表单上传、
+分块上传不等待完整请求体、流式数据保真、提前到达、数据库会话释放和断连清理。
+第十三章独立进程检查使用模拟 Runtime，验证两个副本的就绪与轮询、OpenAI SDK 流式文本和用量、
+Worker 认证，以及缩容清理后的 503 响应，不拉取模型或推理镜像。
 生产启动仍使用 PostgreSQL；真实 GPU/NPU 驱动采集需要在对应机器上验证。

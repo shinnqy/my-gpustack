@@ -52,9 +52,9 @@ def http_exception_factory(
         *,
         log_level=logging.ERROR,
     ):
-        if is_openai_exception:
-            self.__class__.__bases__ = (OpenAIAPIException,)
-        super(self.__class__, self).__init__(
+        self.is_openai_exception = is_openai_exception
+        HTTPException.__init__(
+            self,
             status_code, reason, message, details, log_level=log_level
         )
 
@@ -218,6 +218,8 @@ def register_handlers(app: FastAPI):
                 request.url.path,
                 request.method,
             )
+        if getattr(exc, "is_openai_exception", False):
+            return await openai_api_exception_handler(request, exc)
         return JSONResponse(
             status_code=exc.status_code,
             content=ErrorResponse(
@@ -257,3 +259,26 @@ def register_handlers(app: FastAPI):
                 message=message,
             ).model_dump(),
         )
+
+
+class OpenAIAPIError(BaseModel):
+    message: str
+    type: Optional[str] = None
+    code: Optional[int] = None
+    param: Optional[str] = None
+
+
+class OpenAIAPIErrorResponse(BaseModel):
+    error: OpenAIAPIError
+
+
+openai_api_error_responses = {
+    404: {"model": OpenAIAPIErrorResponse},
+    409: {"model": OpenAIAPIErrorResponse},
+    401: {"model": OpenAIAPIErrorResponse},
+    403: {"model": OpenAIAPIErrorResponse},
+    422: {"model": OpenAIAPIErrorResponse},
+    400: {"model": OpenAIAPIErrorResponse},
+    500: {"model": OpenAIAPIErrorResponse},
+    503: {"model": OpenAIAPIErrorResponse},
+}

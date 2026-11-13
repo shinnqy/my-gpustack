@@ -30,6 +30,11 @@ from gpustack.worker.serve_manager import ServeManager
 from gpustack.worker.model_file_manager import ModelFileManager
 from gpustack.worker.inference_backend_manager import InferenceBackendManager
 from gpustack.worker.workload_cleaner import WorkloadCleaner
+from gpustack.routes.worker import proxy
+from gpustack.api import exceptions
+from starlette.middleware.base import BaseHTTPMiddleware
+from gpustack.routes.worker import proxy
+from starlette.middleware.base import BaseHTTPMiddleware
 
 
 logger = logging.getLogger(__name__)
@@ -210,7 +215,16 @@ class Worker:
         app.state.config = self._config
         app.state.token = read_worker_token(self._config.data_dir)
         app.state.worker_ip_getter = self.worker_ip
+        app.state.get_instance_port_by_model_instance_id = (
+            self._serve_manager.get_instance_port_by_model_instance_id
+        )
+        app.state.record_successful_inference = (
+            self._serve_manager.record_successful_inference
+        )
+        app.add_middleware(BaseHTTPMiddleware, dispatch=proxy.set_port_from_model_name)
         app.include_router(probes.router)
+        app.include_router(proxy.router)
+        exceptions.register_handlers(app)
 
         config = uvicorn.Config(
             app,

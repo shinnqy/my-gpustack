@@ -5,6 +5,8 @@ from gpustack.routes import clusters, models, probes
 from gpustack.routes import clusters, models, probes, workers
 from gpustack.routes import clusters, model_instances, models, probes, workers
 from gpustack.routes import clusters, model_files, model_instances, models, probes, workers
+from gpustack.api.exceptions import openai_api_error_responses
+from gpustack.routes import openai
 
 
 versioned_prefix = "/v2"
@@ -53,3 +55,25 @@ api_router.include_router(v1_base_router, prefix=versioned_prefix)
 
 
 api_router.include_router(probes.router, tags=["Probes"])
+
+
+inference_router = APIRouter()
+
+
+inference_router.include_router(
+    openai.get_legacy_api_router(),
+    prefix="/v1-openai",
+    responses=openai_api_error_responses,
+    tags=["OpenAI-Compatible APIs (Legacy alias)"],
+)
+
+
+inference_router.include_router(
+    openai.get_api_router(),
+    prefix="/v1",
+    responses=openai_api_error_responses,
+    tags=["OpenAI-Compatible APIs"],
+)
+
+
+api_router.include_router(inference_router)
