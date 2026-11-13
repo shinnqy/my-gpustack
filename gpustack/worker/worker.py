@@ -28,6 +28,7 @@ from urllib.parse import urlparse
 from gpustack.utils.uuid import get_worker_name
 from gpustack.worker.serve_manager import ServeManager
 from gpustack.worker.model_file_manager import ModelFileManager
+from gpustack.worker.inference_backend_manager import InferenceBackendManager
 
 
 logger = logging.getLogger(__name__)
@@ -152,6 +153,8 @@ class Worker:
             self._worker_manager.sync_worker_status, envs.WORKER_STATUS_SYNC_INTERVAL
         )
         self._create_async_task(self._serve_apis())
+        inference_backend_manager = InferenceBackendManager(self._clientset)
+        self._serve_manager._inference_backend_manager = inference_backend_manager
         self._create_async_task(self._serve_manager.watch_models())
         self._create_async_task(self._serve_manager.watch_model_instances_event())
         model_file_manager = ModelFileManager(

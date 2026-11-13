@@ -65,6 +65,17 @@ logger = logging.getLogger(__name__)
 create_worker_semaphore = asyncio.Semaphore(10)
 
 
+@router.get("/{id}", response_model=WorkerPublic)
+async def get_worker(id: int):
+    """按 ID 查询 Worker"""
+
+    async with async_session() as session:
+        worker = await Worker.one_by_id(session, id)
+        if worker is None or worker.deleted_at is not None:
+            raise NotFoundException(message=f"Worker {id} not found")
+        return WorkerPublic.model_validate(worker)
+
+
 @router.get("", response_model=WorkersPublic)
 async def get_workers(request: Request, params: ListParams = Depends(), me: Optional[bool] = None):
     async with async_session() as session:

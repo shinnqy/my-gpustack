@@ -7,6 +7,8 @@ import socket
 from typing import List
 import contextlib
 import ipaddress
+import random
+import requests
 
 
 def get_first_non_loopback_ip(expected_ifname: Optional[str] = None) -> str:
@@ -102,6 +104,64 @@ def get_ifname_by_ip_hostname(
     return None
 
 
+def parse_port_range(port_range: str) -> Tuple[int, int]:
+    """
+    解析 40000-40063
+    """
+
+    start, end = port_range.split("-")
+    return int(start), int(end)
+
+
+def get_free_port(
+    port_range: str,
+    unavailable_ports: Optional[set[int]] = None,
+    host: str = "127.0.0.1",
+) -> int:
+    """在范围内随机选择端口，排除内部已占用集合，再通过 TCP 连接探测是否已有服务监听"""
+
+    start, end = parse_port_range(port_range)
+    if unavailable_ports is None:
+        unavailable_ports = set()
+
+    if len(unavailable_ports) >= end - start + 1:
+        raise Exception("No free port available in the port range.")
+
+    while True:
+        port = random.randint(start, end)
+        if port in unavailable_ports:
+            continue
+        if is_port_available(port, host):
+            return port
+        else:
+            unavailable_ports.add(port)
+            if len(unavailable_ports) == end - start + 1:
+                raise Exception("No free port available in the port range.")
+            continue
+
+
+def is_port_available(port: int, host: str = "127.0.0.1") -> bool:
+    """
+    Test if a port is available.
+
+    Returns:
+        True if the port is available, False otherwise.
+    """
+
+    # Then, try to connect (if someone is listening, connect will succeed)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.settimeout(0.5)
+            result = s.connect_ex((host, port))
+            if result == 0:
+                # Someone is listening, port is not available
+                return False
+        except Exception:
+            pass
+
+    return True
+
+
 def is_offline(
     last_update: Optional[datetime],
     timeout_seconds: int,
@@ -132,3 +192,16 @@ def is_offline(
     is_offline_flag = (now_ts - last_update_ts) > timeout_seconds
     last_update_str = last_update.strftime("%Y-%m-%d %H:%M:%S UTC")
     return is_offline_flag, last_update_str
+
+
+def check_registry_reachable(address: str) -> bool:
+    """
+    请求仓库的 /v2/，把状态码小于 500 视为可达，包括需要认证的 401 响应。它供默认仓库选择逻辑使用
+    """
+    url = f"{address}/v2/"
+    try:
+        resp = requests.get(url, timeout=3)
+        reachable = resp.status_code < 500
+    except Exception:
+        reachable = False
+    return reachable

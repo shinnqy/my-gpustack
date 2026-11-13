@@ -5,6 +5,9 @@ from gpustack.client import ClientSet
 from gpustack.client.worker_manager_clients import (
     WorkerRegistrationClient,
 )
+from cachetools import cached
+from gpustack.utils.network import check_registry_reachable
+from cachetools import TTLCache
 
 
 registration_token_filename = "token"
@@ -75,3 +78,24 @@ def registration_client(
         "No registration token configured. "
         "Please provide a valid token via --token or the corresponding configuration."
     )
+
+
+cache = TTLCache(maxsize=3, ttl=3600)
+
+
+@cached(cache)
+def determine_default_registry(override: Optional[str] = None) -> Optional[str]:
+    """
+    显式配置仓库时直接使用；否则探测 Docker Hub、Quay 的可达性。
+    Docker Hub 不可达而 Quay 可达时，返回 quay.io；其余情况保留 Docker 默认行为
+    """
+    if override is not None and len(override) > 0:
+        return override
+    docker_hub_reachable = check_registry_reachable("https://registry-1.docker.io")
+    quay_io_reachable = check_registry_reachable("https://quay.io")
+    if docker_hub_reachable:
+        return None
+    elif quay_io_reachable:
+        return "quay.io"
+    else:
+        return None

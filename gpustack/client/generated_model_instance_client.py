@@ -152,6 +152,10 @@ class ModelInstanceClient:
         except Exception as e:
             logger.error(f"Failed to update model-instances cache from event: {e}")
 
+    def watch(self, callback=None, stop_condition=None, params=None):
+        """同步 Watch 入口"""
+        return asyncio.run(self.awatch(callback=callback, stop_condition=stop_condition, params=params))
+
     async def awatch(
         self,
         callback: Optional[

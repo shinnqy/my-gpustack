@@ -2,8 +2,14 @@ from typing import List
 from typing import Optional
 import shlex
 import re
+from typing import Tuple
+from typing import Union
+from typing import Literal
+from gpustack_runtime.deployer.__utils__ import compare_versions
+
 
 """统一解析后端参数"""
+
 
 _FALSY_VALUES = frozenset({"0", "false", "no", "off", "f", "n"})
 
@@ -91,6 +97,26 @@ def find_bool_parameter(parameters: List[str], param_names: List[str]) -> bool:
             return False
         return True
     return False
+
+
+def extend_args_no_exist(
+    arguments: List[str], *args: Union[str, Tuple[str, str]]
+) -> None:
+    """
+    补充尚未存在的参数
+    """
+    for arg in args:
+        if isinstance(arg, tuple):
+            key, value = arg
+            if not any(
+                existing_arg == key or existing_arg.startswith(f"{key}=")
+                for existing_arg in arguments
+            ):
+                arguments.extend([key, value])
+        else:
+            # Single flag without value
+            if arg not in arguments:
+                arguments.append(arg)
 
 
 def _mask_json_segments(text: str):
@@ -274,3 +300,34 @@ def flatten_to_argv(parameters: Optional[List[str]]) -> List[str]:
         else:
             tokens.append(stripped)
     return tokens
+
+
+ExecutorBackend = Literal["ray", "mp"]
+
+
+_VLLM_RAY_DROPPED_FROM_DEFAULTS = "0.18.0"
+
+
+def should_default_to_ray(backend_version: Optional[str]) -> bool:
+    if not backend_version or "-custom" not in backend_version:
+        return True
+    try:
+        return compare_versions(backend_version, _VLLM_RAY_DROPPED_FROM_DEFAULTS) < 0
+    except Exception:
+        return True
+
+
+def resolve_executor_backend(
+    backend_parameters: Optional[List[str]],
+    backend_version: Optional[str],
+) -> ExecutorBackend:
+    """
+    根据显式参数或版本规则返回 "ray"／`"mp"。
+    显式配置 mp` 时走 MP 分支；否则按代码中的默认策略判断，其中带 -custom 且版本达到 0.18.0 的配置默认走 MP
+    """
+    # 判断什么时候走 ray
+    user_value = find_parameter(backend_parameters, ["distributed-executor-backend"])
+    if user_value is not None:
+        return "mp" if user_value == "mp" else "ray"
+
+    return "ray" if should_default_to_ray(backend_version) else "mp"

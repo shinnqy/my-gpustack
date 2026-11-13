@@ -305,6 +305,7 @@ def test_replayed_scheduled_instance_is_accepted(tmp_path, monkeypatch):
     manager = ServeManager(lambda: 1, lambda: None, cfg)
     started = []
     monkeypatch.setattr(manager, "_start_model_instance", lambda instance: started.append(instance.id))
+    monkeypatch.setattr(manager, "_stop_model_instance", lambda instance, **kwargs: None)
     for event_type in (EventType.CREATED, EventType.UPDATED):
         manager._dispatch_model_instance_event(Event(type=event_type, data={
             "id": 3, "name": "scheduled", "model_id": 1, "model_name": "model",

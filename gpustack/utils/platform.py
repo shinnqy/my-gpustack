@@ -33,3 +33,10 @@ def arch() -> str:
     """
     na = native_arch()
     return _ARCH_ALIAS_MAPPING.get(native_arch(), na)
+
+
+def system_arch() -> str:
+    """
+    Get the system and architecture in the format "system/arch".
+    """
+    return f"{system()}/{arch()}"

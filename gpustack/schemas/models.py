@@ -24,6 +24,8 @@ from gpustack.schemas.links import ModelInstanceDraftModelFileLink
 from gpustack.utils.command import find_parameter
 from pathlib import Path
 from typing import Union
+from dataclasses import dataclass
+from gpustack.utils.command import find_bool_parameter
 
 
 class SourceEnum(str, Enum):
@@ -53,6 +55,14 @@ class BackendEnum(str, Enum):
     ASCEND_MINDIE = "MindIE"
     SGLANG = "SGLang"
     CUSTOM = "Custom"
+
+
+class BackendSourceEnum(str, Enum):
+    """区分内置、社区、自定义后端"""
+
+    CUSTOM = "custom"
+    BUILT_IN = "built_in"
+    COMMUNITY = "community"
 
 
 class GPUSelector(BaseModel):
@@ -300,6 +310,35 @@ class DistributedServers(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+@dataclass
+class ModelInstanceDeploymentMetadata:
+    """
+    Metadata for model instance deployment.
+    """
+
+    name: str
+    """
+    Name for model instance deployment.
+    """
+    distributed: bool = False
+    """
+    Whether the model instance is deployed in distributed mode.
+    """
+    distributed_leader: bool = False
+    """
+    Whether the model instance is the leader in distributed mode.
+    """
+    distributed_follower: bool = False
+    """
+    Whether the model instance is a follower in distributed mode.
+    """
+    distributed_follower_index: Optional[int] = None
+    """
+    Index of the follower in distributed mode.
+    It is None for leader or non-distributed mode.
+    """
+
+
 class ModelInstanceBase(SQLModel, ModelSource):
     name: str = Field(index=True, unique=True)
 
@@ -372,6 +411,50 @@ class ModelInstanceBase(SQLModel, ModelSource):
     model_config = ConfigDict(protected_namespaces=())
 
     cluster_id: Optional[int] = Field(default=None, foreign_key="clusters.id")
+
+    def get_deployment_metadata(
+        self,
+        worker_id: int,
+    ) -> Optional[ModelInstanceDeploymentMetadata]:
+        """
+        判断指定 Worker 是否参与实例、是主节点还是从节点，并生成工作负载名称。
+        比如主节点叫 example，第一个从节点叫 example-f0；无关 Worker 返回 None。
+        这是运行时数据结构，不新增数据库列
+        """
+
+        dservers = self.distributed_servers
+        subworkers = (
+            dservers.subordinate_workers
+            if dservers and dservers.subordinate_workers
+            else []
+        )
+
+        name = self.name
+        distributed = bool(subworkers)
+        distributed_leader = distributed and self.worker_id == worker_id
+        distributed_follower = distributed and not distributed_leader
+        distributed_follower_index = None
+        if distributed_follower:
+            for idx, subworker in enumerate(subworkers):
+                if subworker.worker_id == worker_id:
+                    distributed_follower_index = idx
+                    break
+            if distributed_follower_index is not None:
+                # Mutate the name to include the follower index,
+                # so that each follower has a unique name.
+                name += f"-f{distributed_follower_index}"
+
+        if self.worker_id != worker_id and distributed_follower_index is None:
+            # This model instance is not handling by the given worker.
+            return None
+
+        return ModelInstanceDeploymentMetadata(
+            name=name,
+            distributed=distributed,
+            distributed_leader=distributed_leader,
+            distributed_follower=distributed_follower,
+            distributed_follower_index=distributed_follower_index,
+        )
 
 
 class ModelInstance(ModelInstanceBase, BaseModelMixin, table=True):
@@ -494,6 +577,23 @@ def is_llm_model(model: Model):
         model: Model to check.
     """
     return not model.categories or CategoryEnum.LLM in model.categories
+
+
+def is_omni_model(model: Model) -> bool:
+    """
+    根据 vLLM 的 --omni 参数，或 Image、Text-to-Speech 分类识别模型，供启动参数构造时选择处理分支
+    """
+
+    if model.backend == BackendEnum.VLLM and find_bool_parameter(
+        model.backend_parameters, ["omni"]
+    ):
+        return True
+
+    OMNI_CATEGORIES = (
+        CategoryEnum.IMAGE,
+        CategoryEnum.TEXT_TO_SPEECH,
+    )
+    return any(cat in model.categories for cat in OMNI_CATEGORIES)
 
 
 def get_backend(model: Model) -> str:

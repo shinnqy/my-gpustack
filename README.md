@@ -1,6 +1,6 @@
-# My GPUStack：第十章完成版
+# My GPUStack：第十一章完成版
 
-按 `guide/v1/01`～`10` 的正文及配套辅助代码整理。
+按 `guide/v1/01`～`11` 的正文及配套辅助代码整理。
 已具备集群、模型与实例记录、事件控制器，以及 Worker 注册、设备采集、心跳和状态批量上报。
 已接通模型和实例的 Watch 流、Worker 客户端缓存、ServeManager 订阅骨架，以及 Server 快照缓存和写入后的缓存失效。
 已接通调度器、去重队列、集群/GPU 所在 Worker/标签/就绪状态过滤，以及调度结果回写。
@@ -8,7 +8,8 @@
 新增模型配置与分类识别、权重大小估算、显存分配账本、vLLM 单卡/单机多卡匹配、
 Spread/Binpack 放置评分，以及缩容评分链。
 新增 ModelFile 记录与关联、文件控制器、进程池下载、进度与错误同步、同机文件复用和缓存清理。
-文件准备完成后实例进入 `starting`；推理容器在第十一章接入。
+已接通独立启动子进程、等待文件就绪、端口预留、vLLM 镜像和参数解析，以及 Runtime 工作负载创建。
+文件准备完成后，启动子进程创建推理容器并结束初始化；实例保持 `starting`，健康检查在第十二章接入。
 
 ## 安装与启动
 
@@ -158,7 +159,8 @@ curl -s -X POST http://127.0.0.1:30080/v2/models \
 
 `computed_resource_claim.vram` 是调度预算。模型权重大小仍是经验估算，
 获取仓库大小失败时会退回框架开销；需要确定的预算时，可使用 `GPUSTACK_MODEL_VRAM_CLAIM`。
-当前 Worker 收到分配后会准备模型文件，在 `starting` 等待第十一章接入推理容器。
+当前 Worker 收到分配后会准备文件并创建推理容器。第十一章还未接入删除后的周期性容器清理，
+验证本节的显存释放场景时，删除 Model 后还需手动停止其对应容器。
 
 ## 第十章检查点
 
@@ -212,7 +214,60 @@ Worker 的文件 Watch 断线后会重连，停止时会取消下载并关闭下
 curl -X DELETE 'http://127.0.0.1:30080/v2/model-files/FILE_ID?cleanup=true'
 ```
 
-省略 `cleanup=true` 时保留磁盘文件。实例到达 `starting` 表示文件准备完成，本阶段尚不启动推理进程。
+省略 `cleanup=true` 时保留磁盘文件。实例到达 `starting` 表示文件准备完成，
+第十一章的启动子进程会继续创建推理工作负载。
+
+## 第十一章检查点
+
+执行 `uv sync` 后重启 Server 和 Worker。
+Worker 需要能访问容器运行时；使用 Docker 时，先确认 `docker info` 正常。
+NVIDIA 机器需要驱动和 NVIDIA Container Toolkit；昇腾机器需要驱动和 Ascend Docker Runtime。
+Server 可以部署在其他机器上。
+
+创建一个资源能放下的模型：
+
+```bash
+curl -s -X POST http://127.0.0.1:30080/v2/models \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"engine-demo","source":"huggingface","huggingface_repo_id":"Qwen/Qwen3-0.6B"}'
+```
+
+Worker 为实例预留服务端口，启动独立子进程，再把实例改为 `initializing`。
+子进程通过 Watch 等待模型文件进入 `starting`，构造 Runtime 计划并创建容器，然后结束初始化。
+端口默认在 `40000-40063` 内分配；实例记录包含 `port`、`ports` 和启动子进程的 `pid`。
+
+镜像优先级为：模型的 `image_name`、后端版本配置、`gpustack-runner` 内置镜像目录。
+目录解析会考虑计算后端、宿主平台、运行时版本和昇腾变体。
+可以在模型创建请求中设置完整的 `image_name` 来指定已有镜像。
+
+在 Worker 上按实际实例名查看容器和命令：
+
+```bash
+docker ps --format '{{.Names}}\t{{.Image}}\t{{.Status}}'
+docker inspect INSTANCE_NAME --format '{{json .Config.Entrypoint}} {{json .Config.Cmd}}'
+docker logs -f INSTANCE_NAME
+```
+
+默认命令使用 `vllm serve <模型路径>`，补齐服务地址、端口和模型名；多卡自动设置 TP。
+当模型上下文大于 8192 且用户未设置时，默认限制为 8192。
+用户的 `backend_parameters` 可覆盖默认地址、端口、上下文等参数。
+Runtime 的设备资源键只包含被调度选中的卡，模型目录通过挂载传入容器。
+
+昇腾使用 `huawei.com/devices`，并注入 `TASK_QUEUE_ENABLE`、`CPU_AFFINITY_CONF` 等变量。
+310P 支持完整 SoC 名称和 `310p` 变体标识，自动使用 `--enforce-eager --dtype float16`。
+NVIDIA 使用 `nvidia.com/devices`。
+
+等 vLLM 日志显示服务启动完成后，直接请求 Worker 上分配的端口：
+
+```bash
+curl http://WORKER_IP:INSTANCE_PORT/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"engine-demo","messages":[{"role":"user","content":"你好"}]}'
+```
+
+启动日志在 `<worker-data-dir>/log/serve/<实例ID>.<重启次数>.log`，例如 `1.0.log`。
+本章实例仍保持 `starting`；自动置为 `running`、错误重启和删除后的容器清理由第十二章接入。
+GPUStack 入口 `/v1/chat/completions` 的代理在第十三章接入。
 
 ## 本地验证
 
@@ -230,5 +285,8 @@ uv run --python 3.12 --isolated pytest -q
 模型文件测试覆盖共享和多 Worker 记录、提交关联后发布事件、进度汇总、草稿文件、
 下载失败与重试、缓存清理、下载取消、文件锁、进程池资源关闭，以及保留数据的旧库升级。
 进程验证使用小型 HTTP 测试仓库、真实进程池和模拟 NPU，验证下载字节、文件复用及 `starting` 状态。
+启动测试覆盖 CUDA/CANN 设备选择、挂载和端口、vLLM 参数覆盖、310P 参数与环境变量、
+镜像优先级、运行时版本匹配、子进程启动顺序、端口复用及失败后的状态回写。
+第十一章使用模拟 Runtime 接口验证工作负载计划，不拉取推理镜像；真实 GPU/NPU 推理需要在对应机器上验收。
 生产启动仍使用 PostgreSQL；真实 GPU/NPU 驱动采集需要在对应机器上验证。
 Worker 停止后，本章不会自动重算离线状态；定期失联检查在第十二章实现。

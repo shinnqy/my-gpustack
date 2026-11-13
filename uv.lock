@@ -646,16 +646,19 @@ dependencies = [
     { name = "fastapi" },
     { name = "filelock", version = "4.1.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "filelock", version = "4.2.10", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "gpustack-runner" },
     { name = "gpustack-runtime" },
     { name = "httpx", extra = ["socks"] },
     { name = "huggingface-hub" },
     { name = "importlib-resources" },
     { name = "modelscope" },
+    { name = "packaging" },
     { name = "psutil" },
     { name = "pydantic" },
     { name = "pydantic-settings", version = "2.15.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "pydantic-settings", version = "2.16.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "pyyaml" },
+    { name = "requests" },
     { name = "setproctitle" },
     { name = "sqlalchemy", version = "2.0.57", source = { registry = "https://pypi.org/simple" }, extra = ["asyncio"], marker = "python_full_version < '3.11'" },
     { name = "sqlalchemy", version = "2.1.8", source = { registry = "https://pypi.org/simple" }, extra = ["asyncio"], marker = "python_full_version >= '3.11'" },
@@ -684,15 +687,18 @@ requires-dist = [
     { name = "cachetools" },
     { name = "fastapi", specifier = ">=0.115.0,<0.137.0" },
     { name = "filelock", specifier = ">=3.16" },
+    { name = "gpustack-runner", specifier = "==0.1.27.post4" },
     { name = "gpustack-runtime", specifier = "==0.2.3.post2" },
     { name = "httpx", extras = ["socks"], specifier = ">=0.27.0" },
     { name = "huggingface-hub", specifier = ">=1.0.0,<2" },
     { name = "importlib-resources" },
     { name = "modelscope", specifier = ">=1.28,<2" },
+    { name = "packaging", specifier = ">=24.1" },
     { name = "psutil" },
     { name = "pydantic", specifier = ">=2.11.5" },
     { name = "pydantic-settings", specifier = ">=2.2.1" },
     { name = "pyyaml", specifier = ">=6.0,<7.0" },
+    { name = "requests", specifier = ">=2.32.3" },
     { name = "setproctitle", specifier = ">=1.3.3" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.38" },
     { name = "sqlmodel", specifier = ">=0.0.18" },
@@ -710,7 +716,7 @@ dev = [
 
 [[package]]
 name = "gpustack-runner"
-version = "0.1.32.post5"
+version = "0.1.27.post4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "argcomplete" },
@@ -718,9 +724,9 @@ dependencies = [
     { name = "packaging" },
     { name = "requests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/9c/c4/daa39d789684540d8f235e727395c31a57cc9229bcb71482697cba78aa40/gpustack_runner-0.1.32.post5.tar.gz", hash = "sha256:94330b8d2636930bf07251125ac8d7c618920a15013a695394b7371d3fcb4fd2", size = 13779304, upload-time = "2026-11-06T06:42:55.513Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e2/9e/d2c5bb496b6aa7c3e9dd47dcb1cfa7b3f0023f2d1c62c5081ac2941f0100/gpustack_runner-0.1.27.post4.tar.gz", hash = "sha256:9a7f910c02754e6ee0374c0f121bc60622cb04a8716c3f078a1610939a2672c1", size = 13458052, upload-time = "2026-07-15T06:52:47.698Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/8d/54/12e663b12dceb726f0b27d1dbc483ccf65d14f3b11706087ad051d26b630/gpustack_runner-0.1.32.post5-py3-none-any.whl", hash = "sha256:45d9b5cea909abe1b9a2c2c555ad66e021a0a399e993fee1b2f1c9cb4edfba80", size = 33314, upload-time = "2026-11-06T06:42:53.329Z" },
+    { url = "https://files.pythonhosted.org/packages/13/8c/17f4867fd2fd7bf18b78dd043b45fd80079550b3e1fe363ee9a184bce944/gpustack_runner-0.1.27.post4-py3-none-any.whl", hash = "sha256:0d2e91259b52e41c0fad2e75efc88a79c9e29e66ddac8299890f8ed51c624c1c", size = 30697, upload-time = "2026-07-15T06:52:46.129Z" },
 ]
 
 [[package]]
