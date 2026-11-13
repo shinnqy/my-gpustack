@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlmodel import SQLModel
 from sqlalchemy import inspect
+from sqlalchemy import Enum as SQLAlchemyEnum
 from sqlalchemy.schema import CreateColumn
 from gpustack import envs
 from gpustack.server import db
@@ -57,6 +58,7 @@ async def init_db_engine(db_url: str):
 async def create_db_and_tables(engine: AsyncEngine):
     async with engine.begin() as conn:
         await conn.run_sync(_upgrade_model_instance_columns)
+        await conn.run_sync(_upgrade_worker_columns)
         await conn.run_sync(
             SQLModel.metadata.create_all,
             tables=[
@@ -85,5 +87,20 @@ def _upgrade_model_instance_columns(connection):
     table_name = connection.dialect.identifier_preparer.quote(table.name)
     for column in table.columns:
         if column.name in additions and column.name not in existing:
+            declaration = str(CreateColumn(column).compile(dialect=connection.dialect))
+            connection.exec_driver_sql(f"ALTER TABLE {table_name} ADD COLUMN {declaration}")
+
+
+def _upgrade_worker_columns(connection):
+    inspector = inspect(connection)
+    table = Worker.__table__
+    if not inspector.has_table(table.name):
+        return
+    existing = {column["name"] for column in inspector.get_columns(table.name)}
+    table_name = connection.dialect.identifier_preparer.quote(table.name)
+    for column in table.columns:
+        if column.name in {"maintenance", "proxy_mode", "proxy_address"} and column.name not in existing:
+            if connection.dialect.name == "postgresql" and isinstance(column.type, SQLAlchemyEnum):
+                column.type.create(connection, checkfirst=True)
             declaration = str(CreateColumn(column).compile(dialect=connection.dialect))
             connection.exec_driver_sql(f"ALTER TABLE {table_name} ADD COLUMN {declaration}")

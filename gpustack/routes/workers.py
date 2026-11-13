@@ -14,6 +14,7 @@ from gpustack.schemas.common import ListParams
 from gpustack.schemas.workers import (
     Worker,
     WorkerCreate,
+    WorkerUpdate,
     WorkerPublic,
     WorkerRegistrationPublic,
     WorkerStateEnum,
@@ -22,6 +23,8 @@ from gpustack.schemas.workers import (
 )
 from gpustack.security import API_KEY_PREFIX
 from gpustack.server.db import async_session
+from gpustack.server.services import WorkerService
+from gpustack.server.cache import delete_cache_by_key
 from gpustack.server.worker_status_buffer import (
     heartbeat_flush_buffer,
     heartbeat_flush_buffer_lock,
@@ -65,17 +68,6 @@ logger = logging.getLogger(__name__)
 create_worker_semaphore = asyncio.Semaphore(10)
 
 
-@router.get("/{id}", response_model=WorkerPublic)
-async def get_worker(id: int):
-    """按 ID 查询 Worker"""
-
-    async with async_session() as session:
-        worker = await Worker.one_by_id(session, id)
-        if worker is None or worker.deleted_at is not None:
-            raise NotFoundException(message=f"Worker {id} not found")
-        return WorkerPublic.model_validate(worker)
-
-
 @router.get("", response_model=WorkersPublic)
 async def get_workers(request: Request, params: ListParams = Depends(), me: Optional[bool] = None):
     async with async_session() as session:
@@ -89,6 +81,40 @@ async def get_workers(request: Request, params: ListParams = Depends(), me: Opti
         return result
 
 
+@router.put("/{id}", response_model=WorkerPublic)
+async def update_worker(id: int, input: WorkerUpdate):
+    async with async_session() as session:
+        worker = await Worker.one_by_id(session, id, for_update=True)
+        if worker is None or worker.deleted_at is not None:
+            raise NotFoundException(message=f"Worker {id} not found")
+        for name in input.model_fields_set:
+            setattr(worker, name, getattr(input, name))
+        worker.compute_state()
+        await WorkerService(session).update(worker)
+        return WorkerPublic.model_validate(worker)
+
+
+@router.delete("/{id}")
+async def delete_worker(id: int):
+    async with async_session() as session:
+        worker = await Worker.one_by_id(session, id, for_update=True)
+        if worker is None or worker.deleted_at is not None:
+            raise NotFoundException(message=f"Worker {id} not found")
+        await worker.delete(session)
+        await delete_cache_by_key(WorkerService(session).get_by_id, id)
+
+
+@router.get("/{id}", response_model=WorkerPublic)
+async def get_worker(id: int):
+    """按 ID 查询 Worker"""
+
+    async with async_session() as session:
+        worker = await Worker.one_by_id(session, id)
+        if worker is None or worker.deleted_at is not None:
+            raise NotFoundException(message=f"Worker {id} not found")
+        return WorkerPublic.model_validate(worker)
+
+
 def update_worker_data(
     worker_in: WorkerCreate,
     existing: Optional[Worker] = None,
@@ -97,7 +123,13 @@ def update_worker_data(
     to_create_worker = None
     cluster: Optional[Cluster] = kwargs.get("cluster")
     if existing is not None:
+        # Preserve maintenance field from existing worker if not explicitly set in worker_in
         incoming_data = worker_in.model_dump()
+        if (
+            incoming_data.get("maintenance") is None
+            and existing.maintenance is not None
+        ):
+            incoming_data["maintenance"] = existing.maintenance
 
         to_create_worker = Worker.model_validate(
             {

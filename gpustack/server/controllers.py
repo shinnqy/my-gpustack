@@ -46,6 +46,13 @@ from sqlmodel import select
 from gpustack.schemas.links import ModelInstanceDraftModelFileLink
 from sqlalchemy.orm.attributes import flag_modified
 from gpustack.schemas.models import ModelInstanceSubordinateWorker
+from gpustack.schemas.workers import Worker
+from gpustack.schemas.workers import WorkerStateEnum
+from gpustack.utils.model_instance_workers import get_model_instance_worker_match
+from gpustack.schemas.clusters import Cluster
+from gpustack.schemas.clusters import ClusterProvider
+from gpustack.schemas.clusters import ClusterStateEnum
+from gpustack.schemas.config import GatewayModeEnum
 
 
 logger = logging.getLogger(__name__)
@@ -485,6 +492,139 @@ async def sync_ready_replicas(session: AsyncSession, model: Model) -> bool:
     return False
 
 
+class WorkerController:
+    def __init__(self, cfg: Config):
+        self._config = cfg
+
+    async def start(self):
+        """
+        Start the controller.
+        """
+
+        async for event in Worker.subscribe(source="worker_controller"):
+            if event.type == EventType.HEARTBEAT:
+                continue
+            if not isinstance(event.data, Worker):
+                continue
+            try:
+                await self._reconcile(event)
+            except Exception as e:
+                logger.error(f"Failed to reconcile worker: {e}")
+
+    async def _reconcile(self, event: Event):
+        """
+        Delete instances base on the worker state and event type.
+        """
+        if event.type not in (EventType.UPDATED, EventType.DELETED):
+            return
+        worker: Worker = event.data
+        if not worker:
+            return
+
+        if worker.state.is_provisioning and worker.state != WorkerStateEnum.DELETING:
+            # Skip reconciliation for provisioning and deleting workers.
+            # There is a dedicated controller to handle provisioning.
+            return
+
+        if event.type == EventType.UPDATED:
+            changed_fields = event.changed_fields
+            if not changed_fields or "state" not in changed_fields:
+                # No state change
+                return
+
+        async with async_session() as session:
+            all_instances = await ModelInstance.all_by_field(
+                session, "cluster_id", worker.cluster_id
+            )
+            if not all_instances:
+                return
+            matched_instances = []
+            for instance in all_instances:
+                match = get_model_instance_worker_match(
+                    instance,
+                    worker_name=worker.name,
+                    worker_id=worker.id,
+                )
+                if match.matched:
+                    matched_instances.append((instance, match))
+            if not matched_instances:
+                return
+
+            if event.type == EventType.DELETED:
+                instance_names = await ModelInstanceService(session).batch_delete(
+                    [instance for instance, _ in matched_instances]
+                )
+                if instance_names:
+                    logger.info(
+                        f"Delete instance {', '.join(instance_names)} "
+                        f"since worker {worker.name} is deleted"
+                    )
+                return
+
+            if (
+                worker.unreachable
+                or worker.state == WorkerStateEnum.UNREACHABLE
+                or worker.state == WorkerStateEnum.NOT_READY
+            ):
+                await self.update_impacted_instance_states_to_unreachable(
+                    session,
+                    matched_instances,
+                    worker.name,
+                )
+                return
+
+    async def update_impacted_instance_states_to_unreachable(
+        self,
+        session,
+        matched_instances,
+        worker_name,
+    ):
+        instance_names = set()
+        subordinate_worker_names = set()
+        for instance, match in matched_instances:
+            patch = {}
+            distributed_servers_changed = False
+            if (
+                match.is_main_worker
+                and instance.state == ModelInstanceStateEnum.RUNNING
+            ):
+                patch["state"] = ModelInstanceStateEnum.UNREACHABLE
+                patch["state_message"] = "Worker is unreachable from the server"
+                instance_names.add(instance.name)
+
+            for index in match.subordinate_worker_indexes:
+                subordinate_worker = instance.distributed_servers.subordinate_workers[
+                    index
+                ]
+                if subordinate_worker.state == ModelInstanceStateEnum.UNREACHABLE:
+                    continue
+                subordinate_worker.state = ModelInstanceStateEnum.UNREACHABLE
+                subordinate_worker.state_message = (
+                    "Worker is unreachable from the server"
+                )
+                subordinate_worker_names.add(
+                    f"{instance.name}:{subordinate_worker.worker_name}"
+                )
+                distributed_servers_changed = True
+
+            if distributed_servers_changed:
+                patch["distributed_servers"] = instance.distributed_servers
+                flag_modified(instance, "distributed_servers")
+
+            if patch:
+                await ModelInstanceService(session).update(instance, patch)
+        if instance_names:
+            logger.info(
+                f"Marked instance {', '.join(instance_names)} unreachable "
+                f"since worker {worker_name} is unreachable from the server"
+            )
+        if subordinate_worker_names:
+            logger.info(
+                f"Marked subordinate workers {', '.join(subordinate_worker_names)} unreachable "
+                f"since worker {worker_name} is unreachable from the server"
+            )
+
+
 class ModelFileController:
     """
     把文件变化传播给实例
@@ -902,3 +1042,52 @@ def _get_worker_ids_for_file_download(
         ]
 
     return worker_ids
+
+
+class ClusterController:
+    def __init__(self, cfg: Config):
+        self._cfg = cfg
+        self._disable_gateway = cfg.gateway_mode == GatewayModeEnum.disabled
+        pass
+
+    async def start(self):
+        """
+        Start the controller.
+        """
+        async for event in Cluster.subscribe(source="cluster_controller"):
+            if event.type == EventType.HEARTBEAT:
+                continue
+            try:
+                await self._reconcile(event)
+            except Exception as e:
+                logger.error(f"Failed to reconcile cluster: {e}")
+
+    async def _reconcile(self, event: Event):
+        """
+        Reconcile the cluster state.
+        """
+        await self._sync_cluster_state(event)
+        if self._disable_gateway:
+            return
+
+    async def _sync_cluster_state(self, event: Event):
+        if event.type == EventType.DELETED:
+            return
+        cluster: Cluster = event.data
+        if not cluster:
+            return
+        async with async_session() as session:
+            cluster: Cluster = await Cluster.one_by_id(
+                session, cluster.id, options=[selectinload(Cluster.cluster_workers)]
+            )
+            if not cluster or cluster.provider in [
+                ClusterProvider.Kubernetes,
+                ClusterProvider.Docker,
+            ]:
+                return
+            if cluster.workers == 0 and cluster.state != ClusterStateEnum.PENDING:
+                cluster.state = ClusterStateEnum.PENDING
+                cluster.state_message = (
+                    "No workers have been provisioned for this cluster yet."
+                )
+                await cluster.update(session=session, auto_commit=True)

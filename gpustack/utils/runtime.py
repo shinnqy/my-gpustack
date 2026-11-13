@@ -1,11 +1,10 @@
 from typing import Optional
-
 from gpustack_runtime import envs
 from gpustack_runtime.deployer import DockerDeployer, WorkloadPlan
 from gpustack_runtime.deployer.docker import DockerWorkloadPlan
-
 from gpustack.config.config import Config
 from gpustack.utils.config import apply_registry_override_to_image
+from gpustack_runtime.deployer import WorkloadStatus
 
 
 def transform_workload_plan(
@@ -24,3 +23,39 @@ def transform_workload_plan(
         ),
         **workload.__dict__,
     )
+
+
+def is_benchmark_workload(status: WorkloadStatus) -> bool:
+    """
+    Check if a workload is a benchmark workload.
+
+    A workload is considered a benchmark workload if it has the 'type' label
+    set to 'benchmark'.
+
+    Args:
+        status: The workload status to check.
+
+    Returns:
+        True if the workload is a benchmark workload, False otherwise.
+    """
+    if not status.labels:
+        return False
+    return status.labels.get("type") == "benchmark"
+
+
+def is_cache_service_workload(status: WorkloadStatus) -> bool:
+    """
+    Check if a workload is a cache service workload.
+
+    A workload is considered a cache service workload if it has the 'type'
+    label set to 'cache-service'.
+
+    Args:
+        status: The workload status to check.
+
+    Returns:
+        True if the workload is a cache service workload, False otherwise.
+    """
+    if not status.labels:
+        return False
+    return status.labels.get("type") == "cache-service"

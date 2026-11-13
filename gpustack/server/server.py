@@ -25,6 +25,11 @@ from gpustack.config.registration import write_registration_token
 from gpustack.server.worker_status_buffer import flush_worker_status_to_db
 from gpustack.scheduler.scheduler import Scheduler
 from gpustack.server.controllers import ModelFileController
+from fastapi import FastAPI
+from gpustack.server.worker_syncer import WorkerSyncer
+from gpustack.server.worker_instance_cleaner import WorkerInstanceCleaner
+from gpustack.server.controllers import ClusterController
+from gpustack.server.controllers import WorkerController
 
 
 logger = logging.getLogger(__name__)
@@ -99,8 +104,12 @@ class Server:
         tasks.append(asyncio.create_task(model_controller.start()))
         model_instance_controller = ModelInstanceController(self._config)
         tasks.append(asyncio.create_task(model_instance_controller.start()))
+        worker_controller = WorkerController(self._config)
+        tasks.append(asyncio.create_task(worker_controller.start()))
         model_file_controller = ModelFileController()
         tasks.append(asyncio.create_task(model_file_controller.start()))
+        cluster_controller = ClusterController(self._config)
+        tasks.append(asyncio.create_task(cluster_controller.start()))
         logger.debug("Controllers started.")
         return tasks
 
@@ -111,6 +120,8 @@ class Server:
         """
         self._start_scheduler()
         self._start_controllers()
+        self._start_worker_instance_cleaner()
+        self._start_worker_syncer(self._app)
 
     def _should_create_default_cluster(self) -> bool:
         # only server or both will get into this logic
@@ -183,3 +194,18 @@ class Server:
         task = asyncio.create_task(scheduler.start())
         logger.debug("Scheduler started.")
         return task
+
+    def _start_worker_syncer(self, app: FastAPI):
+        worker_syncer = WorkerSyncer(
+            lambda: getattr(app.state, "http_client", None),
+            lambda: getattr(app.state, "http_client_no_proxy", None),
+        )
+        self._create_async_task(worker_syncer.start())
+
+        logger.debug("Worker syncer started.")
+
+    def _start_worker_instance_cleaner(self):
+        worker_instance_cleaner = WorkerInstanceCleaner()
+        self._create_async_task(worker_instance_cleaner.start())
+
+        logger.debug("Worker instance cleaner started.")

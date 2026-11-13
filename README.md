@@ -1,6 +1,6 @@
-# My GPUStack：第十一章完成版
+# My GPUStack：第十二章完成版
 
-按 `guide/v1/01`～`11` 的正文及配套辅助代码整理。
+按 `guide/v1/01`～`12` 的正文及配套辅助代码整理。
 已具备集群、模型与实例记录、事件控制器，以及 Worker 注册、设备采集、心跳和状态批量上报。
 已接通模型和实例的 Watch 流、Worker 客户端缓存、ServeManager 订阅骨架，以及 Server 快照缓存和写入后的缓存失效。
 已接通调度器、去重队列、集群/GPU 所在 Worker/标签/就绪状态过滤，以及调度结果回写。
@@ -9,7 +9,9 @@
 Spread/Binpack 放置评分，以及缩容评分链。
 新增 ModelFile 记录与关联、文件控制器、进程池下载、进度与错误同步、同机文件复用和缓存清理。
 已接通独立启动子进程、等待文件就绪、端口预留、vLLM 镜像和参数解析，以及 Runtime 工作负载创建。
-文件准备完成后，启动子进程创建推理容器并结束初始化；实例保持 `starting`，健康检查在第十二章接入。
+已接通推理就绪检查、运行状态同步、错误重启与指数退避、删除后的容器收割，
+以及 Worker 失联检测、维护模式和离线实例清理。
+文件准备完成后，启动子进程创建推理容器并结束初始化；容器运行且就绪检查通过后，实例进入 `running`。
 
 ## 安装与启动
 
@@ -159,8 +161,8 @@ curl -s -X POST http://127.0.0.1:30080/v2/models \
 
 `computed_resource_claim.vram` 是调度预算。模型权重大小仍是经验估算，
 获取仓库大小失败时会退回框架开销；需要确定的预算时，可使用 `GPUSTACK_MODEL_VRAM_CLAIM`。
-当前 Worker 收到分配后会准备文件并创建推理容器。第十一章还未接入删除后的周期性容器清理，
-验证本节的显存释放场景时，删除 Model 后还需手动停止其对应容器。
+当前 Worker 收到分配后会准备文件并创建推理容器。
+删除 Model 后，周期性状态同步会停止对应容器，释放实际显存。
 
 ## 第十章检查点
 
@@ -229,7 +231,7 @@ Server 可以部署在其他机器上。
 ```bash
 curl -s -X POST http://127.0.0.1:30080/v2/models \
   -H 'Content-Type: application/json' \
-  -d '{"name":"engine-demo","source":"huggingface","huggingface_repo_id":"Qwen/Qwen3-0.6B"}'
+  -d '{"name":"engine-demo","source":"model_scope","model_scope_model_id":"Qwen/Qwen3-0.6B"}'
 ```
 
 Worker 为实例预留服务端口，启动独立子进程，再把实例改为 `initializing`。
@@ -266,8 +268,68 @@ curl http://WORKER_IP:INSTANCE_PORT/v1/chat/completions \
 ```
 
 启动日志在 `<worker-data-dir>/log/serve/<实例ID>.<重启次数>.log`，例如 `1.0.log`。
-本章实例仍保持 `starting`；自动置为 `running`、错误重启和删除后的容器清理由第十二章接入。
+第十二章已接通自动置为 `running`、错误重启和删除后的容器清理，检查方法见下文。
 GPUStack 入口 `/v1/chat/completions` 的代理在第十三章接入。
+
+## 第十二章检查点
+
+执行 `uv sync` 后重启 Server 和 Worker，启动方式见上文。启动时会为旧 Worker 表补齐
+`maintenance`、`proxy_mode` 和 `proxy_address` 三个可空字段，保留已有记录。
+
+按第十一章示例创建模型后，观察实例和模型：
+
+```bash
+curl -s http://127.0.0.1:30080/v2/model-instances | python -m json.tool
+curl -s http://127.0.0.1:30080/v2/models | python -m json.tool
+```
+
+Worker 默认每 3 秒检查工作负载。vLLM 容器运行且 Worker 地址上的 `/v1/models` 返回 200 后，
+实例从 `starting` 变为 `running`，模型的 `ready_replicas` 随之增加。
+容器失败、退出或消失时，实例进入 `error`，`state_message` 保留运行时原因和退出码。
+
+用无效参数验证错误恢复：
+
+```bash
+curl -s -X POST http://127.0.0.1:30080/v2/models \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"bad","source":"model_scope","model_scope_model_id":"Qwen/Qwen3-0.6B","backend_parameters":["--no-such-flag"]}'
+```
+
+默认 `restart_on_error=true`。Worker 每 10 秒处理错误实例，经 `scheduled` 重新走启动流程；
+首次无需退避，连续失败后依次等待 10、20、40 秒，最长 300 秒。
+观察 `restart_count`、`last_restart_time` 和编号日志，确认在重试；
+设置模型的 `restart_on_error=false` 可停止自动重启。实例成功进入 `running` 后清空连续失败退避。
+
+删除模型时，Worker 周期性收割 Server 已不再分配给自己的实例并停止容器。
+清理前会用不分页、绕过客户端缓存的请求确认删除；Server 请求失败不会当作“所有实例已删除”。
+Worker 还每 120 秒检查遗留工作负载，启动后延迟 15 秒，默认只清理创建超过 300 秒的孤儿。
+
+在 Worker 终端按 Ctrl-C，观察 `/v2/workers` 和实例状态：
+
+- Server 每 15 秒探测 Worker 的 `/healthz`；不可达时将 Worker 标为 `unreachable`。
+- 心跳中断超过默认 150 秒后，Worker 变为 `not_ready`，其上的实例标为 `unreachable`。
+- Server 每 30 秒清理心跳中断超过 300 秒的非维护 Worker 上的实例；模型控制器补齐副本，再由调度器选择可用 Worker。
+- 清理前恢复 Worker 时，使用原数据目录、名称和端口启动；心跳和就绪检查恢复后，实例回到 `running`，复用仍存在的推理容器。
+
+主动连通性探测默认 `auto`：Worker 数量超过 50 时跳过主动探测，心跳检查仍运行。
+可通过 `GPUSTACK_WORKER_UNREACHABLE_CHECK_MODE=enabled` 或 `disabled` 明确控制主动探测。
+
+计划停机前，可按查询到的 Worker ID 和现有名称启用维护模式：
+
+```bash
+curl -s -X PUT http://127.0.0.1:30080/v2/workers/WORKER_ID \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"GPU_NODE_NAME","maintenance":{"enabled":true,"message":"计划维护"}}'
+```
+
+维护 Worker 不会因离线被自动删除实例，也不接收新的调度。
+恢复后用同一接口把 `maintenance.enabled` 改为 `false`。未提供的标签等字段保留原值。
+
+可选的主动推理检查默认关闭。在模型 `env` 中设置
+`GPUSTACK_MODEL_INFERENCE_HEALTH_CHECK_ENABLED=true` 后，会按模型类别发起小请求，
+默认间隔 300 秒、超时 15 秒、连续失败 3 次才将实例标为 `error`。
+对应的 `GPUSTACK_MODEL_INFERENCE_HEALTH_CHECK_INTERVAL`、`_TIMEOUT` 和 `_FAILURE_THRESHOLD`
+可分别覆盖这些值。推理检查也走前述错误恢复流程。
 
 ## 本地验证
 
@@ -288,5 +350,8 @@ uv run --python 3.12 --isolated pytest -q
 启动测试覆盖 CUDA/CANN 设备选择、挂载和端口、vLLM 参数覆盖、310P 参数与环境变量、
 镜像优先级、运行时版本匹配、子进程启动顺序、端口复用及失败后的状态回写。
 第十一章使用模拟 Runtime 接口验证工作负载计划，不拉取推理镜像；真实 GPU/NPU 推理需要在对应机器上验收。
+健康恢复测试覆盖运行时状态与 HTTP 就绪、错误原因、指数退避、恢复保护、缓存重连时的收割确认、
+可选主动推理检查、心跳恢复、维护接口、集群隔离、离线实例重建、孤儿清理及保留数据的 Worker 表升级。
+第十二章独立 Server/Worker 进程检查使用临时 SQLite、模拟 Runtime 和本地 HTTP 推理替身，
+验证就绪、故障重启、Worker 失联与重连、复用原工作负载，以及删除模型后的进程清理。
 生产启动仍使用 PostgreSQL；真实 GPU/NPU 驱动采集需要在对应机器上验证。
-Worker 停止后，本章不会自动重算离线状态；定期失联检查在第十二章实现。

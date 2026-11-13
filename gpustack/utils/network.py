@@ -9,6 +9,9 @@ import contextlib
 import ipaddress
 import random
 import requests
+from urllib.parse import urlparse
+from functools import lru_cache
+import os
 
 
 def get_first_non_loopback_ip(expected_ifname: Optional[str] = None) -> str:
@@ -205,3 +208,73 @@ def check_registry_reachable(address: str) -> bool:
     except Exception:
         reachable = False
     return reachable
+
+
+@lru_cache(maxsize=1)
+def _get_no_proxy_cidrs() -> Tuple[ipaddress.IPv4Network, ...]:
+    """
+    Parse NO_PROXY environment variable to get a list of CIDR networks.
+    """
+    no_proxy = (os.getenv("NO_PROXY") or os.getenv("no_proxy") or "").strip()
+    if not no_proxy:
+        return ()
+    cidrs = []
+    for entry in no_proxy.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        try:
+            net = ipaddress.IPv4Network(entry, strict=False)
+            cidrs.append(net)
+        except ValueError:
+            # Ignore non-CIDR entries (including domain names, plain IPs, etc.)
+            pass
+    return tuple(cidrs)
+
+
+def use_proxy_env_for_url(url: str) -> bool:
+    """
+    Determine if proxy environment variables (HTTP_PROXY, HTTPS_PROXY, etc.)
+    should be used for the given URL.
+
+    This is a workaround for the fact that current HTTP clients (e.g., httpx)
+    do not support CIDR notation in NO_PROXY.
+    Ref: https://github.com/encode/httpx/issues/1536
+
+    - If the host is an IP address:
+        Do **not** use proxy if it falls within any CIDR defined in NO_PROXY.
+        -> Return False in that case.
+    - If the host is a domain name:
+        Defer to the HTTP client's standard NO_PROXY logic (which doesn't support CIDR),
+        so assume proxy **should** be used unless explicitly overridden elsewhere.
+        -> Return True.
+
+    Args:
+        url (str): Full URL (e.g., 'http://192.168.1.10:8080/path')
+
+    Returns:
+        bool: True if proxy environment variables should be used, False if the request
+              should bypass the proxy (e.g., due to NO_PROXY CIDR match).
+    """
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname
+        if not host:
+            return True
+
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            # It's a domain name -> defer to standard NO_PROXY logic (no CIDR support)
+            return True
+
+        # Check against user-defined CIDRs in NO_PROXY
+        for net in _get_no_proxy_cidrs():
+            if ip in net:
+                # Host is in a NO_PROXY CIDR -> bypass proxy
+                return False
+
+        return True
+    except Exception:
+        # On any error (e.g., malformed URL), default to using proxy
+        return True

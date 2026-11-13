@@ -25,6 +25,7 @@ class WorkerService:
         self, worker: Worker, source: Union[dict, SQLModel, None] = None, **kwargs
     ):
         result = await worker.update(self.session, source, **kwargs)
+        await delete_cache_by_key(self.get_by_id, worker.id)
         return result
 
     async def batch_update(
@@ -37,8 +38,18 @@ class WorkerService:
             return 0
 
         updated = await Worker.batch_update(self.session, workers)
+        for worker in workers:
+            await delete_cache_by_key(self.get_by_id, worker.id)
 
         return updated
+
+    @locked_cached()
+    async def get_by_id(self, worker_id: int) -> Optional[Worker]:
+        result = await Worker.one_by_id(self.session, worker_id)
+        if result is None:
+            return None
+        self.session.expunge(result)
+        return result
 
 
 class ModelService:

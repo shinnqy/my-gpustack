@@ -29,6 +29,7 @@ from gpustack.utils.uuid import get_worker_name
 from gpustack.worker.serve_manager import ServeManager
 from gpustack.worker.model_file_manager import ModelFileManager
 from gpustack.worker.inference_backend_manager import InferenceBackendManager
+from gpustack.worker.workload_cleaner import WorkloadCleaner
 
 
 logger = logging.getLogger(__name__)
@@ -98,6 +99,10 @@ class Worker:
             clientset_getter=self.clientset,
             cfg=self._config,
         )
+        self._workload_cleaner = WorkloadCleaner(
+            worker_id_getter=self.worker_id,
+            clientset_getter=self.clientset,
+        )
 
     @tenacity.retry(
         stop=tenacity.stop_after_attempt(10),
@@ -155,8 +160,19 @@ class Worker:
         self._create_async_task(self._serve_apis())
         inference_backend_manager = InferenceBackendManager(self._clientset)
         self._serve_manager._inference_backend_manager = inference_backend_manager
+        run_periodically_in_thread(
+            self._serve_manager.sync_model_instances_state,
+            envs.MODEL_INSTANCE_HEALTH_CHECK_INTERVAL,
+        )
+        run_periodically_in_thread(
+            self._serve_manager.sync_model_instances_inference_health, 10,
+        )
+        run_periodically_in_thread(
+            self._workload_cleaner.cleanup_orphan_workloads, 120, 15
+        )
         self._create_async_task(self._serve_manager.watch_models())
         self._create_async_task(self._serve_manager.watch_model_instances_event())
+        self._create_async_task(self._serve_manager.watch_model_instances())
         model_file_manager = ModelFileManager(
             worker_id=self._worker_id, clientset=self._clientset, cfg=self._config
         )

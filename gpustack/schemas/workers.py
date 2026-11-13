@@ -27,6 +27,7 @@ from sqlmodel import ForeignKey
 from sqlmodel import Integer
 from sqlmodel import Relationship
 from .clusters import Cluster
+from gpustack.schemas.config import ModelInstanceProxyModeEnum
 
 
 class UtilizationInfo(BaseModel):
@@ -154,6 +155,11 @@ class SystemInfo(BaseModel):
     uptime: Optional[UptimeInfo] = Field(sa_column=Column(JSON), default=None)
 
 
+class Maintenance(BaseModel):
+    enabled: bool = False
+    message: Optional[str] = None
+
+
 class WorkerStatus(SystemInfo):
     gpu_devices: Optional[GPUDevicesStatus] = Field(
         sa_column=Column(JSON), default=None
@@ -177,23 +183,34 @@ class WorkerStatus(SystemInfo):
 
 class WorkerStatusStored(BaseModel):
     advertise_address: Optional[str] = None
+
     hostname: str
+
     ip: str
+
     ifname: str
+
     port: int
+
     metrics_port: Optional[int] = None
 
     system_reserved: Optional[SystemReserved] = Field(
         default=None, sa_column=Column(pydantic_column_type(SystemReserved))
     )
+
     state_message: Optional[str] = Field(
         default=None, sa_column=Column(Text, nullable=True)
     )
+
     status: Optional[WorkerStatus] = Field(
         sa_column=Column(pydantic_column_type(WorkerStatus))
     )
 
     worker_uuid: str = Field(sa_column=Column(String(255), nullable=False))
+
+    proxy_mode: Optional[ModelInstanceProxyModeEnum] = Field(
+        default=ModelInstanceProxyModeEnum.WORKER,
+    )
 
 
 class WorkerStatusPublic(WorkerStatusStored):
@@ -202,7 +219,13 @@ class WorkerStatusPublic(WorkerStatusStored):
 
 class WorkerUpdate(SQLModel):
     name: str = Field(index=True, unique=True)
+
     labels: Dict[str, str] = Field(sa_column=Column(JSON), default={})
+
+    maintenance: Optional[Maintenance] = Field(
+        default=None,
+        sa_column=Column(pydantic_column_type(Maintenance), default=None),
+    )
 
 
 class WorkerCreate(WorkerStatusStored, WorkerUpdate):
@@ -218,23 +241,31 @@ class WorkerCreate(WorkerStatusStored, WorkerUpdate):
 
 class WorkerBase(WorkerCreate):
     state: WorkerStateEnum = WorkerStateEnum.NOT_READY
+
     heartbeat_time: Optional[datetime] = Field(
         sa_column=Column(UTCDateTime), default=None
     )
+
     unreachable: bool = False
 
     def compute_state(self):
+        if self.maintenance and self.maintenance.enabled:
+            self.state = WorkerStateEnum.MAINTENANCE
+            self.state_message = self.maintenance.message
+            return
         if self.state.is_provisioning:
             return
-        if self.state == WorkerStateEnum.NOT_READY and self.state_message is not None:
+        if (
+            self.state == WorkerStateEnum.NOT_READY
+            and self.state_message is not None
+            and not self.state_message.startswith("Heartbeat lost (")
+        ):
             return
-
         is_not_ready_flag, last_heartbeat_str = is_offline(
             self.heartbeat_time,
             envs.WORKER_HEARTBEAT_GRACE_PERIOD,
             datetime.now(timezone.utc),
         )
-
         if is_not_ready_flag:
             reschedule_minutes = envs.MODEL_INSTANCE_RESCHEDULE_GRACE_PERIOD / 60
             self.state = WorkerStateEnum.NOT_READY
@@ -246,7 +277,6 @@ class WorkerBase(WorkerCreate):
                 "Otherwise, please <a href='https://docs.gpustack.ai/latest/troubleshooting/#view-gpustack-logs'>check the worker logs</a>."
             )
             return
-
         if self.unreachable:
             address = self.advertise_address or self.ip
             healthz_url = f"http://{address}:{self.port}/healthz"
@@ -259,9 +289,21 @@ class WorkerBase(WorkerCreate):
             self.state = WorkerStateEnum.UNREACHABLE
             self.state_message = msg
             return
-
         self.state = WorkerStateEnum.READY
         self.state_message = None
+
+    proxy_address: Optional[str] = Field(
+        default=None, sa_column=Column(String(255), nullable=True)
+    )
+
+    def get_proxy_address(self) -> Optional[str]:
+        """
+        Get the proxy address for the worker. If the worker has a proxy_address, return it.
+        Otherwise, return None to indicate that no proxy should be used.
+        """
+        if self.proxy_mode != ModelInstanceProxyModeEnum.TUNNEL:
+            return None
+        return self.proxy_address
 
 
 class Worker(WorkerBase, BaseModelMixin, table=True):

@@ -11,6 +11,20 @@ class GatewayModeEnum(str, Enum):
     disabled = "disabled"
 
 
+class ModelInstanceProxyModeEnum(str, Enum):
+    """
+    Enum for Model Instance Proxy Mode
+    WORKER - Proxy through the worker
+    DIRECT - Direct access to the model instance
+    DELEGATED - Preserved for proxying through cluster gateway (not implemented yet)
+    """
+
+    WORKER = "worker"
+    DIRECT = "direct"
+    DELEGATED = "delegated"
+    TUNNEL = "tunnel"
+
+
 class SensitivePredefinedConfig(BaseModel):
     # Common options
     huggingface_token: Optional[str] = Field(
