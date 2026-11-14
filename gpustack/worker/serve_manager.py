@@ -11,7 +11,6 @@ from typing import Set
 import time
 from gpustack.schemas.models import ModelInstanceStateEnum
 from gpustack.api.exceptions import NotFoundException
-from gpustack.schemas.models import ModelInstanceUpdate
 from gpustack.utils.attrs import set_attr
 from gpustack.server.bus import EventType
 from gpustack.config import registration
@@ -44,6 +43,19 @@ import requests
 from datetime import datetime
 from datetime import timezone
 from gpustack.utils.convert import safe_int
+from gpustack.schemas.models import DistributedServerCoordinateModeEnum
+from gpustack.schemas.models import ModelInstanceSubordinateWorker
+from gpustack.utils.command import find_int_parameter
+from gpustack.utils.command import find_parameter
+from gpustack.utils.command import resolve_executor_backend
+from gpustack.worker.model_meta import get_meta_from_running_instance
+from gpustack.routes.worker.logs import extract_container_restart_count
+from pathlib import Path
+import re
+from gpustack.schemas.models import ModelUpdate
+from collections import deque
+from gpustack.routes.worker.logs import extract_restart_count
+from gpustack_runtime.deployer import logs_workload
 
 
 logger = logging.getLogger(__name__)
@@ -53,6 +65,9 @@ _INFERENCE_HEALTH_CHECK_FAILED_MESSAGE = "Inference health check failed."
 
 
 _WORKLOAD_FAILED_MESSAGE = "Inference server exited or unhealthy."
+
+# 日志线程的生命周期管理
+LOG_RECONNECT_GRACE_SECONDS = envs.MODEL_INSTANCE_HEALTH_CHECK_INTERVAL + 2
 
 
 _port_lock = threading.Lock()
@@ -136,6 +151,10 @@ class ServeManager:
         self._serve_log_dir = f"{cfg.log_dir}/serve"
         self._clientset_getter = clientset_getter
         self._provisioning_processes = {}
+        # 实例 ID → 该实例的日志线程列表
+        self._log_persistence_threads = {}
+        # 实例 ID → 用于停止这些线程的 Event 列表
+        self._log_persistence_stop_events = {}
         self._error_model_instances = {}
         self._model_cache_by_instance = {}
         self._model_instance_by_instance_id = {}
@@ -203,6 +222,15 @@ class ServeManager:
     def _dispatch_model_instance_event(self, event: Event):  # noqa: C901
         """
         根据事件和实例状态，决定本机该做什么
+
+        SCHEDULED
+            → 主 Worker 分配端口、进入初始化
+            → 各 Worker 准备模型文件
+            → 全部文件就绪，实例进入 STARTING
+            → 主机器创建 vLLM + ray-head
+            → 从机器启动 Ray 节点
+            → 检查主从状态和主服务 HTTP 就绪
+            → RUNNING
         """
         mi = ModelInstance.model_validate(event.data)
 
@@ -214,10 +242,36 @@ class ServeManager:
 
         if is_main_worker:
             self._model_instance_by_instance_id[mi.id] = mi
+            """在主 Worker 分支中增加 RUN_FIRST 判断"""
+            if (
+                # 实例具有分布式配置
+                mi.distributed_servers
+                # 配置要求从节点先准备好
+                and mi.distributed_servers.mode == DistributedServerCoordinateModeEnum.RUN_FIRST
+                # 至少一个从节点还没有运行
+                and any(sw.state != ModelInstanceStateEnum.RUNNING for sw in mi.distributed_servers.subordinate_workers or [])
+                # 当前不是删除事件，避免准备状态阻断删除处理
+                and event.type != EventType.DELETED
+            ):
+                if mi.state == ModelInstanceStateEnum.SCHEDULED:
+                    model = self._get_model(mi)
+                    self._assign_ports(mi, model, get_backend(model))
+                    self._update_model_instance(mi.id, state=ModelInstanceStateEnum.INITIALIZING, port=mi.port, ports=mi.ports)
+                return
         else:
             # Return if it isn't a distribution serving.
-            if not mi.distributed_servers:
+            """强化非主 Worker 的退出条件"""
+            if (
+                # 没有分布式配置的实例
+                not mi.distributed_servers
+                # 已将协调工作委托给其他框架的实例
+                or mi.distributed_servers.mode == DistributedServerCoordinateModeEnum.DELEGATED
+                # 本机根本没有参与的实例
+                or not any(sw.worker_id == self._worker_id for sw in mi.distributed_servers.subordinate_workers or [])
+            ):
                 return
+            """从 Worker 也要跟踪实例，供后面的健康检查、重启轮次判断和清理使用"""
+            self._model_instance_by_instance_id[mi.id] = mi
 
         if event.type == EventType.DELETED:
             # Teardown is left to the periodic reap in sync_model_instances_state,
@@ -231,8 +285,8 @@ class ServeManager:
             )
             return
 
-        if event.type == EventType.UPDATED:
-            if mi.state == ModelInstanceStateEnum.ERROR:
+        if mi.state == ModelInstanceStateEnum.ERROR:
+            if is_main_worker:
                 model = self._get_model(mi)
                 if model.restart_on_error:
                     """如果配置了 restart_on_error ，先记录到错误实例缓存，等待后续重启处理。"""
@@ -240,8 +294,37 @@ class ServeManager:
                     logger.trace(
                         f"UPDATED event: cached error model instance {mi.name} for restart."
                     )
-                return
+            return
 
+        if not is_main_worker:
+            """完整的从 Worker 分支"""
+            if mi.state == ModelInstanceStateEnum.SCHEDULED:
+                # 实例重新进入 SCHEDULED，说明本机可能需要清理上一轮工作负载。清理会移除本地跟踪数据，所以随后重新保存当前实例；`False` 表示不在这里清除退避信息
+                self._stop_model_instance(mi, clear_restart_backoff=False)
+                self._model_instance_by_instance_id[mi.id] = mi
+            if mi.state not in {ModelInstanceStateEnum.STARTING, ModelInstanceStateEnum.RUNNING}:
+                # 只有进入启动阶段，或者重连时看到已经运行的实例，从 Worker 才继续处理
+                return
+            """按从属列表顺序找到本机。在到达本机之前，前面的从属记录需要已经是 RUNNING 或 ERROR，否则等待"""
+            for sw in mi.distributed_servers.subordinate_workers:
+                if sw.worker_id == self._worker_id:
+                    break
+                if sw.state not in {ModelInstanceStateEnum.RUNNING, ModelInstanceStateEnum.ERROR}:
+                    return
+            if self._is_provisioning(mi):
+                return
+            metadata = mi.get_deployment_metadata(self._worker_id)
+            workload = get_workload(metadata.name)
+            # 已运行或失败的从属节点交给健康循环处理；全局重启后才启动新一轮。
+            if not workload and sw.state not in {
+                ModelInstanceStateEnum.RUNNING, ModelInstanceStateEnum.ERROR,
+                ModelInstanceStateEnum.UNREACHABLE,
+            }:
+                """只有本机尚无工作负载，而且本轮还没有运行、失败或失联，才启动。已经失败的从节点交给整体恢复流程，避免每次事件都自行重新拉起"""
+                self._start_model_instance(mi)
+            return
+
+        if event.type == EventType.UPDATED:
             # Restart if scheduled and this is the assigned worker.
             if is_main_worker and mi.state == ModelInstanceStateEnum.SCHEDULED:
                 """
@@ -251,6 +334,15 @@ class ServeManager:
                 logger.trace(
                     f"UPDATED event: restarted scheduled model instance {mi.name}."
                 )
+            elif (
+                mi.distributed_servers
+                and mi.distributed_servers.mode == DistributedServerCoordinateModeEnum.RUN_FIRST
+                and mi.state == ModelInstanceStateEnum.STARTING
+                and not self._is_provisioning(mi)
+                and not get_workload(mi.name)
+            ):
+                """准备条件满足后，主 Worker 开始启动，同时避免重复创建进程或容器"""
+                self._start_model_instance(mi)
 
             return
 
@@ -286,7 +378,18 @@ class ServeManager:
             logger.warning(f"Model instance {mi.name} is provisioning. Skipping start.")
             return
 
+        # 负责日志文件的轮转
+        self._cleanup_old_logs(mi.id, mi.restart_count or 0)
         is_main_worker = mi.worker_id == self._worker_id
+        """定位本机的从属位置"""
+        sw_pos = next((i for i, sw in enumerate(
+            mi.distributed_servers.subordinate_workers if mi.distributed_servers else []
+        ) if sw.worker_id == self._worker_id), None)
+        if not is_main_worker and sw_pos is None:
+            """本机既不是主节点、也不是参与的从节点，就不应该创建工作负载"""
+            return
+        """保存本轮启动上下文"""
+        self._model_instance_by_instance_id[mi.id] = mi
 
         log_file_path = self._get_numbered_log_path(mi)
 
@@ -330,6 +433,8 @@ class ServeManager:
             process.daemon = False
             process.start()
             self._provisioning_processes[mi.id] = process
+            # 负责容器日志的持久化
+            self._start_container_log_persistence(mi)
 
             """子进程创建成功后，回报初始化状态"""
             if is_main_worker:
@@ -339,6 +444,21 @@ class ServeManager:
                     "ports": mi.ports,
                     "pid": process.pid,
                 }
+            else:
+                # 取出本机记录
+                sw = mi.distributed_servers.subordinate_workers[sw_pos]
+                # 根据协调模式选择启动状态
+                sw.state = (
+                    ModelInstanceStateEnum.RUNNING
+                    if mi.distributed_servers.mode == DistributedServerCoordinateModeEnum.INITIALIZE_LATER
+                    else ModelInstanceStateEnum.INITIALIZING
+                )
+                # 清除上一轮错误信息
+                sw.state_message = ""
+                # 记录本机部署子进程 PID
+                sw.pid = process.pid
+                # 只提交本机的从属记录
+                patch_dict = {f"distributed_servers.subordinate_workers.{sw_pos}": sw}
 
             self._update_model_instance(mi.id, **patch_dict)
             logger.info(
@@ -361,6 +481,12 @@ class ServeManager:
                     "state": ModelInstanceStateEnum.ERROR,
                     "state_message": f"Failed to start model instance: {e}",
                 }
+            else:
+                """异常分支的身份区分"""
+                sw = mi.distributed_servers.subordinate_workers[sw_pos]
+                sw.state = ModelInstanceStateEnum.ERROR
+                sw.state_message = f"Failed to start model instance: {e}"
+                patch_dict = {f"distributed_servers.subordinate_workers.{sw_pos}": sw}
 
             self._update_model_instance(mi.id, **patch_dict)
             logger.error(f"Failed to start model instance {mi.name}: {e}")
@@ -378,14 +504,13 @@ class ServeManager:
             # 获取 Server 上的实例数据
             mi_public = self._clientset.model_instances.get(id=id)
 
-            # 转成更新请求对象
-            mi = ModelInstanceUpdate(**mi_public.model_dump())
-            # 应用本次修改，例如 state=INITIALIZING
-            for key, value in kwargs.items():
-                set_attr(mi, key, value)
-
+            # 转成更新请求对象：现在由 Server 合并和验证本次字段修改。
+            # 应用本次修改，例如 state=INITIALIZING，不覆盖其他 Worker 的字段。
+            tracked = self._model_instance_by_instance_id.get(id, mi_public)
             # 发给 Server 保存
-            self._clientset.model_instances.update(id=id, model_update=mi)
+            self._clientset.model_instances.patch(
+                id=id, updates=kwargs, expected_restart_count=tracked.restart_count or 0,
+            )
         except NotFoundException:
             logger.warning(
                 f"Model instance with ID {id} not found when trying to update."
@@ -456,30 +581,79 @@ class ServeManager:
         """
         复用已有端口或选择空闲的主服务端口，用锁和内部预留集合避免本管理器重复分配。
         """
+        """
+        从分配一个 HTTP 端口扩展为分配通信端口组
+        """
+        # 先判断是否真的有从属机器，只有分布式结构存在、从属列表非空，才需要额外端口
+        distributed = bool(mi.distributed_servers and mi.distributed_servers.subordinate_workers)
+        # 确定按 Ray 还是 MP 的布局准备端口
+        executor = resolve_executor_backend(
+            getattr(model, 'backend_parameters', None), getattr(model, 'backend_version', None)
+        )
+        # 未解析镜像版本时预留完整布局，兼容镜像解析后选中的 MP 默认值。
+        mp_ports = distributed and backend == BackendEnum.VLLM and (
+            executor == 'mp' or not getattr(model, 'backend_version', None)
+            and find_parameter(getattr(model, 'backend_parameters', None), ['distributed-executor-backend']) is None
+        )
+        # 第二种情况采用预先多留端口的策略：镜像解析可能稍后补全版本，最终默认后端可能成为 MP。
+        dp = find_int_parameter(getattr(model, 'backend_parameters', None), ['data-parallel-size', 'dp'])
+        extra_count = 3 if mp_ports else (1 if distributed and dp and dp > 1 else 0)
+        expected = 1 + (extra_count + 1 if distributed else 0)
+        # 取得服务端口段边界
+        start, end = network.parse_port_range(self._config.service_port_range)
         with _port_lock:
-            if mi.port:
+            if mi.port and len(mi.ports or [mi.port]) >= expected:
                 mi.ports = mi.ports or [mi.port]
-                used = set().union(*(ports for id, ports in self._assigned_ports.items() if id != mi.id))
-                if used.intersection(mi.ports):
-                    raise RuntimeError(f"Ports already reserved by another model instance: {mi.ports}")
-                self._assigned_ports[mi.id] = set(mi.ports)
+                reserved = set(mi.ports)
+                if mp_ports:
+                    reserved.update(range(mi.ports[-1], min(mi.ports[-1] + 10, end + 1)))
+                self._assigned_ports[mi.id] = reserved
                 return
-
-            if self._assigned_ports:
-                unavailable_ports = set.union(*self._assigned_ports.values())
-            else:
-                unavailable_ports = set()
-
-            # Main serving port
-            mi.port = network.get_free_port(
-                port_range=self._config.service_port_range,
-                unavailable_ports=unavailable_ports,
-                host=mi.worker_ip,
+            # 汇总其他实例的预留端口，排除本实例，避免本实例重新分配时与自己的旧账本冲突
+            unavailable = set().union(*(ports for mid, ports in self._assigned_ports.items() if mid != mi.id))
+            # 保留已有 HTTP 端口，或者申请一个新的；然后重新构造本次端口列表和临时预留集合
+            mi.port = mi.port or network.get_free_port(
+                port_range=self._config.service_port_range, unavailable_ports=unavailable, host=mi.worker_ip,
             )
             mi.ports = [mi.port]
-            unavailable_ports.add(mi.port)
-
-            self._assigned_ports[mi.id] = set(mi.ports)
+            reserved = {mi.port}
+            unavailable.add(mi.port)
+            if distributed:
+                if mp_ports:
+                    """mp 分支"""
+                    # DP 主端口会使用其后连续十个端口；整个区间都参与后续实例的预留。
+                    if end - start + 1 < 14:
+                        raise ValueError('MP multi-node serving requires at least 14 ports in service_port_range')
+                    blocked_starts = {port-offset for port in unavailable for offset in range(10)
+                                      if start <= port-offset <= end-9}
+                    while True:
+                        connecting = network.get_free_port(
+                            port_range=f'{start}-{end-9}', unavailable_ports=blocked_starts, host=mi.worker_ip,
+                        )
+                        band = set(range(connecting, connecting + 10))
+                        if all(network.is_port_available(port, mi.worker_ip) for port in band):
+                            break
+                        blocked_starts.add(connecting)
+                    reserved.update(band)
+                    unavailable.update(band)
+                else:
+                    connecting = network.get_free_port(
+                        port_range=self._config.service_port_range, unavailable_ports=unavailable, host=mi.worker_ip,
+                    )
+                    reserved.add(connecting)
+                    unavailable.add(connecting)
+                # ports[0]: HTTP; [1]: DP RPC; [2]: PyTorch master; [3]: VLLM_PORT;
+                # ports[-1]: connecting port / VLLM_DP_MASTER_PORT. Ray 只使用需要的子集。
+                """依次申请中间角色需要的端口，最后再追加 connecting，使 ports[-1] 始终代表连接基准端口。列表顺序表示用途，不表示端口数值由小到大"""
+                for _ in range(extra_count):
+                    port = network.get_free_port(
+                        port_range=self._config.service_port_range, unavailable_ports=unavailable, host=mi.worker_ip,
+                    )
+                    mi.ports.append(port)
+                    reserved.add(port)
+                    unavailable.add(port)
+                mi.ports.append(connecting)
+            self._assigned_ports[mi.id] = reserved
 
     def _restart_model_instance(self, mi: ModelInstance):
         """
@@ -500,6 +674,8 @@ class ServeManager:
         """
 
         logger.debug(f"Stopping model instance {mi.name or mi.id}")
+        # 先通知日志线程退出，再终止部署进程、删除工作负载，避免日志线程继续围绕已删除容器重连。
+        self._stop_container_log_persistence(mi.id)
 
         # Teardown provisioning process if still alive.
         if self._is_provisioning(mi):
@@ -521,6 +697,8 @@ class ServeManager:
         self._last_successful_inference.pop(mi.id, None)
         if clear_restart_backoff:
             self._restart_backoff_counts.pop(mi.id, None)
+        if delete_logs:
+            self._purge_instance_logs(mi.id)
 
         logger.info(f"Stopped model instance {mi.name or mi.id}")
 
@@ -595,8 +773,14 @@ class ServeManager:
         }
 
         # Optional periodic reconciliation against DB truth even when the cache
-        # reports nothing reapable. Disabled by default; opt in via the
-        # GPUSTACK_MODEL_INSTANCE_STATE_RECONCILE_INTERVAL env var.
+        # reports nothing reapable. The cache and local serving state are both
+        # fed by the same awatch stream, so a ghost re-seeded into the cache
+        # sits in both and `local - cache` never flags it; an independent DB
+        # read is the only thing that catches that. Disabled by default (the
+        # server-side cached_all fix plus reconnect-driven reaping cover the
+        # realistic cases); opt in via the
+        # GPUSTACK_MODEL_INSTANCE_STATE_RECONCILE_INTERVAL env var when a
+        # coordinator may drop DELETEDs on a live stream.
         reconcile_interval = envs.MODEL_INSTANCE_STATE_RECONCILE_INTERVAL
         now = time.time()
         force_authoritative = (
@@ -616,6 +800,11 @@ class ServeManager:
                 params={"page": -1},
                 use_cache=False,
             )
+            # Any successful authoritative fetch counts as a reconciliation —
+            # whether triggered by the timer or by a reap candidate — so reset
+            # the timer here (list() raises on API failure, so a failed fetch
+            # doesn't advance it and the next tick retries). Skipped when the
+            # backstop is disabled to keep the timestamp meaningless-but-inert.
             if reconcile_interval > 0:
                 self._last_state_reconcile_time = now
             all_items = response.items or []
@@ -657,6 +846,21 @@ class ServeManager:
                 and model_instance.state != ModelInstanceStateEnum.SCHEDULED
             ):
                 model_instances.append(model_instance)
+            if (
+                model_instance.distributed_servers
+                and model_instance.distributed_servers.subordinate_workers
+                and model_instance.distributed_servers.mode != DistributedServerCoordinateModeEnum.DELEGATED
+                and model_instance.state in {
+                    ModelInstanceStateEnum.STARTING, ModelInstanceStateEnum.RUNNING,
+                    ModelInstanceStateEnum.ERROR, ModelInstanceStateEnum.UNREACHABLE,
+                }
+            ):
+                """从属实例筛选，筛出需要本机主动管理的分布式实例"""
+                # 只将本机参与、而且已经开始处理的记录加入检查。`PENDING` 还没有工作负载，不能因为查不到容器就误判失败
+                for sw in model_instance.distributed_servers.subordinate_workers:
+                    if sw.worker_id == self._worker_id and sw.state != ModelInstanceStateEnum.PENDING:
+                        model_instances.append(model_instance)
+                        break
 
         for model_instance in model_instances:
             # Skip if the provision process has not exited yet.
@@ -673,6 +877,17 @@ class ServeManager:
             # since their workload name differs from the model instance name.
             if is_main_worker:
                 workload = get_workload(model_instance.name)
+            else:
+                """使用本机实际工作负载名称，如 模型名-f0，否则从机器会一直查询主工作负载名称"""
+                deployment_metadata = model_instance.get_deployment_metadata(
+                    self._worker_id
+                )
+                workload_name = (
+                    deployment_metadata.name
+                    if deployment_metadata
+                    else model_instance.name
+                )
+                workload = get_workload(workload_name)
 
             if workload and workload.state in [
                 WorkloadStatusStateEnum.PENDING,
@@ -702,6 +917,26 @@ class ServeManager:
                             patch_dict = {
                                 "state": ModelInstanceStateEnum.ERROR,
                                 "state_message": failure_message,
+                            }
+                        # Get patch dict for subordinate worker.
+                        else:
+                            """找到本机记录，把 Runtime 诊断写到自己的状态字段，然后 PATCH。主实例状态由已有的汇总流程处理"""
+                            sw_pos = next(
+                                (
+                                    i
+                                    for i, sw in enumerate(
+                                        model_instance.distributed_servers.subordinate_workers
+                                    )
+                                    if sw.worker_id == self._worker_id
+                                ),
+                            )
+                            sw = model_instance.distributed_servers.subordinate_workers[
+                                sw_pos
+                            ]
+                            sw.state = ModelInstanceStateEnum.ERROR
+                            sw.state_message = failure_message
+                            patch_dict = {
+                                f"distributed_servers.subordinate_workers.{sw_pos}": sw,
                             }
                         # Update model instance.
                         self._update_model_instance(model_instance.id, **patch_dict)
@@ -752,6 +987,17 @@ class ServeManager:
                             "state": ModelInstanceStateEnum.RUNNING,
                             "state_message": "",
                         }
+
+                        # Fetch model meta once running.
+                        meta = get_meta_from_running_instance(
+                            model_instance, backend, model
+                        )
+                        if meta:
+                            # Some meta is set in server evaluation and should be preserved, so we update meta instead of overwrite.
+                            merged_meta = dict(model.meta or {})
+                            merged_meta.update(meta)
+                            if merged_meta != model.meta:
+                                self._update_model(model.id, meta=merged_meta)
                     elif subordinate_state["should_update"]:
                         patch_dict = {
                             "state": subordinate_state["state"],
@@ -759,6 +1005,30 @@ class ServeManager:
                         }
                     else:
                         continue
+                # Get patch dict for subordinate worker.
+                else:
+                    # Otherwise, update subordinate worker state to RUNNING.
+                    sw_pos = next(
+                        (
+                            i
+                            for i, sw in enumerate(
+                                model_instance.distributed_servers.subordinate_workers
+                            )
+                            if sw.worker_id == self._worker_id
+                        ),
+                    )
+                    sw = model_instance.distributed_servers.subordinate_workers[sw_pos]
+                    if sw.state in {ModelInstanceStateEnum.RUNNING, ModelInstanceStateEnum.ERROR}:
+                        continue
+                    worker = self._clientset.workers.get(self._worker_id)
+                    if worker.state not in {WorkerStateEnum.READY, WorkerStateEnum.MAINTENANCE}:
+                        continue
+                    """故障恢复：从属失败会上升为整个实例失败"""
+                    sw.state = ModelInstanceStateEnum.RUNNING
+                    sw.state_message = ""
+                    patch_dict = {
+                        f"distributed_servers.subordinate_workers.{sw_pos}": sw,
+                    }
                 # Update model instance.
                 self._update_model_instance(model_instance.id, **patch_dict)
 
@@ -865,12 +1135,27 @@ class ServeManager:
 
         with contextlib.suppress(NotFoundException):
             self._restart_backoff_counts[mi.id] = backoff_count + 1
+            distributed_patch = {}
+            if mi.distributed_servers and mi.distributed_servers.subordinate_workers:
+                servers = mi.distributed_servers.model_copy(deep=True)
+                for sw in servers.subordinate_workers:
+                    # 状态：允许新一轮启动
+                    sw.state = ModelInstanceStateEnum.PENDING
+                    # 消息：清除上一轮错误
+                    sw.state_message = ""
+                    # PID：旧进程编号不再有效
+                    sw.pid = None
+                    # 端口和参数：不能继续冒用上一轮的启动结果
+                    sw.ports = []
+                    sw.arguments = []
+                distributed_patch["distributed_servers"] = servers
             self._update_model_instance(
                 mi.id,
                 restart_count=restart_count + 1,
                 last_restart_time=current_time,
                 state=ModelInstanceStateEnum.SCHEDULED,
                 state_message="",
+                **distributed_patch,
             )
 
         # Pop from error model instances,
@@ -1021,6 +1306,371 @@ class ServeManager:
         if not instance or instance.state != ModelInstanceStateEnum.RUNNING:
             return None
         return instance.ports[0] if instance.ports else instance.port
+
+    def _persist_container_logs(
+        self,
+        # 实际工作负载名称
+        workload_name: str,
+        # 保存位置
+        log_path: str,
+        # 外部停止信号
+        stop_event: threading.Event,
+        # Runtime 用来选择具体容器的操作标识；不传时读取默认容器
+        token: Optional[str] = None,
+    ):
+        """
+        持续读取一个容器的日志并保存
+        """
+        retry_count = 0
+        first_connect = True
+        # Anchor: a window of the last lines written. Matching a run of lines
+        # (not one) avoids false-matching a repeated line during replay.
+        anchor_window = deque(maxlen=5)
+
+        while not stop_event.is_set():
+            try:
+                log_stream = logs_workload(
+                    name=workload_name,
+                    token=token,
+                    tail=-1,
+                    follow=True,
+                )
+
+                if hasattr(log_stream, '__iter__'):
+                    # On reconnect the runtime replays history from the start;
+                    # skip it until the anchor window matches.
+                    anchor = list(anchor_window)
+                    skip_until_anchor = not first_connect and bool(anchor)
+                    replayed = deque(maxlen=len(anchor)) if anchor else None
+                    received_lines = False
+                    with open(
+                        log_path,
+                        'w' if first_connect else 'a',
+                        buffering=1,
+                        encoding='utf-8',
+                    ) as f:
+                        first_connect = False
+                        for line in log_stream:
+                            received_lines = True
+                            if stop_event.is_set():
+                                break
+
+                            if isinstance(line, bytes):
+                                line = line.decode('utf-8', errors='replace')
+                            else:
+                                line = str(line)
+
+                            if skip_until_anchor:
+                                replayed.append(line)
+                                if list(replayed) == anchor:
+                                    skip_until_anchor = False
+                                continue
+
+                            f.write(line)
+                            f.flush()
+                            anchor_window.append(line)
+                    retry_count = 0
+
+                    # Anchor never matched -> rotated out; restart fresh. An
+                    # empty reconnect must NOT reset, or the next round reopens
+                    # in 'w' and truncates the saved log.
+                    if skip_until_anchor and received_lines:
+                        first_connect = True
+                        anchor_window.clear()
+
+                # A restart briefly looks terminated at EOF; wait for the
+                # container to return before giving up, so logs aren't dropped.
+                if stop_event.is_set() or not self._wait_for_container_recovery(
+                    workload_name, stop_event
+                ):
+                    break
+                logger.debug(
+                    f"Log stream for {workload_name} ended while workload still "
+                    f"running; reconnecting"
+                )
+                stop_event.wait(timeout=1)
+
+            except Exception as e:
+                if stop_event.is_set():
+                    break
+                retry_count += 1
+                logger.debug(
+                    f"Container not ready for {workload_name}, retrying "
+                    f"(attempt {retry_count}): {e}"
+                )
+                stop_event.wait(timeout=2)
+
+        logger.debug(f"Log persistence thread for {workload_name} exiting")
+
+    def _container_still_running(self, workload_name: str) -> bool:
+        """
+        判断是否值得继续重连
+        """
+        try:
+            workload = get_workload(workload_name)
+        except Exception:
+            return True  # transient query failure: reconnect, don't drop logs
+        return bool(workload) and workload.state in (
+            WorkloadStatusStateEnum.PENDING,
+            WorkloadStatusStateEnum.INITIALIZING,
+            WorkloadStatusStateEnum.RUNNING,
+        )
+
+    def _wait_for_container_recovery(
+        self,
+        workload_name: str,
+        stop_event: threading.Event,
+        grace_seconds: float = LOG_RECONNECT_GRACE_SECONDS,
+        poll_interval: float = 1.0,
+    ) -> bool:
+        """
+        容忍容器短暂重启
+        """
+        attempts = max(1, int(grace_seconds / poll_interval))
+        for _ in range(attempts):
+            if stop_event.is_set():
+                return False
+            if self._container_still_running(workload_name):
+                return True
+            stop_event.wait(timeout=poll_interval)
+        return False
+
+    def _discover_sidecar_logs(
+        self,
+        mi_id: int,
+        workload_name: str,
+        restart_count: int,
+        stop_event: threading.Event,
+    ):
+        """
+        等待 Ray head 等侧车容器出现
+        """
+        while not stop_event.is_set():
+            try:
+                workload = get_workload(workload_name)
+                if workload and workload.loggable:
+                    sidecars = [op for op in workload.loggable if op.name != "default"]
+                    if sidecars:
+                        self._start_sidecar_log_threads(
+                            mi_id,
+                            workload_name,
+                            workload.loggable,
+                            restart_count,
+                        )
+                        logger.debug(f"Sidecar discovery for {workload_name} complete")
+                        return
+            except Exception:
+                pass
+            stop_event.wait(timeout=2)
+
+    def _start_sidecar_log_threads(
+        self,
+        mi_id: int,
+        workload_name: str,
+        loggable_ops: list,
+        restart_count: int,
+    ):
+        """
+        每个侧车建立独立的日志采集线程
+        """
+        names = []
+        for op in loggable_ops:
+            if op.name == "default":
+                continue  # Main container handled by caller thread
+
+            log_path = (
+                f"{self._serve_log_dir}/{mi_id}.container."
+                f"{op.name}.{restart_count}.log"
+            )
+            stop_event = threading.Event()
+
+            thread = threading.Thread(
+                target=self._persist_container_logs,
+                args=(workload_name, log_path, stop_event, op.token),
+                daemon=True,
+                name=f"log-persist-{workload_name}-{op.name}",
+            )
+            thread.start()
+
+            # Append to existing tracking lists.
+            self._log_persistence_threads.setdefault(mi_id, []).append(thread)
+            self._log_persistence_stop_events.setdefault(mi_id, []).append(stop_event)
+            names.append(op.name)
+
+        if names:
+            logger.debug(
+                f"Started sidecar log persistence threads for {workload_name}: "
+                f"{names}"
+            )
+
+    def _start_container_log_persistence(self, mi: ModelInstance):
+        """
+        创建实例的日志线程组
+        """
+
+        # Stop and clean up existing threads if any
+        self._stop_container_log_persistence(mi.id)
+
+        # Use deployment metadata name for the actual workload name,
+        # which differs for subordinate workers (e.g., "model-f0").
+        deployment_metadata = mi.get_deployment_metadata(self._worker_id)
+        workload_name = deployment_metadata.name if deployment_metadata else mi.name
+
+        restart_count = mi.restart_count or 0
+        log_path = f"{self._serve_log_dir}/{mi.id}.container.{restart_count}.log"
+
+        stop_event = threading.Event()
+
+        # Main container log thread.
+        thread = threading.Thread(
+            target=self._persist_container_logs,
+            args=(workload_name, log_path, stop_event),
+            daemon=True,
+            name=f"log-persist-{workload_name}",
+        )
+        # Sidecar discovery thread — polls until sidecar containers appear,
+        # then starts additional log threads for each.
+        discovery_thread = threading.Thread(
+            target=self._discover_sidecar_logs,
+            args=(mi.id, workload_name, restart_count, stop_event),
+            daemon=True,
+            name=f"log-discover-{workload_name}",
+        )
+        self._log_persistence_threads[mi.id] = [thread, discovery_thread]
+        self._log_persistence_stop_events[mi.id] = [stop_event]
+        thread.start()
+        discovery_thread.start()
+        logger.debug(f"Started container log persistence thread for {mi.name}")
+
+    def _stop_container_log_persistence(
+        self, model_instance_id: int, timeout: float = 2.0
+    ):
+        """
+        协作式停止全部采集线程
+        """
+        # Signal all threads to stop
+        stop_events = self._log_persistence_stop_events.pop(model_instance_id, [])
+        for stop_event in stop_events:
+            stop_event.set()
+
+        # Wait for all threads to finish
+        threads = self._log_persistence_threads.pop(model_instance_id, [])
+        for thread in threads:
+            if thread and thread.is_alive():
+                thread.join(timeout=timeout)
+                if thread.is_alive():
+                    logger.warning(
+                        f"Log persistence thread {thread.name} for model instance "
+                        f"{model_instance_id} did not stop within {timeout}s"
+                    )
+
+    def _cleanup_old_logs(self, model_instance_id: int, current_restart_count: int):
+        """
+        负责日志文件的轮转
+        """
+        if current_restart_count == 0:
+            self._purge_instance_logs(model_instance_id)
+            return
+
+        try:
+            log_dir = Path(self._serve_log_dir)
+
+            # Separate main logs, container logs, and sidecar container logs
+            main_log_pattern = f"{model_instance_id}.*.log"
+            all_main_logs = [
+                f for f in log_dir.glob(main_log_pattern) if '.container.' not in f.name
+            ]
+
+            container_log_pattern = f"{model_instance_id}.container.*.log"
+            all_container_files = list(log_dir.glob(container_log_pattern))
+
+            # Split into default container logs (e.g., 42.container.0.log)
+            # and sidecar container logs (e.g., 42.container.ray-head.0.log)
+            default_container_logs = [
+                f
+                for f in all_container_files
+                if extract_container_restart_count(f.name) > 0
+                or re.match(rf'{model_instance_id}\.container\.\d+\.log', f.name)
+            ]
+            sidecar_container_logs = [
+                f for f in all_container_files if f not in default_container_logs
+            ]
+
+            self._cleanup_log_type(all_main_logs, current_restart_count, "main")
+            self._cleanup_log_type(
+                default_container_logs, current_restart_count, "container"
+            )
+            self._cleanup_log_type(
+                sidecar_container_logs, current_restart_count, "sidecar_container"
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to cleanup old logs for {model_instance_id}: {e}")
+
+    def _cleanup_log_type(
+        self,
+        log_files: List[Path],
+        current_restart_count: int,
+        log_type: str,
+    ):
+        """保留当前与上一轮"""
+
+        keep = {current_restart_count}
+        if current_restart_count > 0:
+            keep.add(current_restart_count - 1)
+
+        def _extract_sidecar_restart_count(filename: str) -> int:
+            """Extract restart count from {id}.container.{name}.{restart_count}.log"""
+            match = re.match(r'\d+\.container\.[^.]+\.(\d+)\.log', filename)
+            return int(match.group(1)) if match else 0
+
+        extract_fns = {
+            "main": extract_restart_count,
+            "container": extract_container_restart_count,
+            "sidecar_container": _extract_sidecar_restart_count,
+        }
+        extract_fn = extract_fns.get(log_type, extract_container_restart_count)
+
+        for f in log_files:
+            rc = extract_fn(f.name)
+            if rc in keep:
+                continue
+            try:
+                f.unlink()
+                logger.info(f"Deleted old {log_type} log file: {f}")
+            except Exception as e:
+                logger.warning(f"Failed to delete {log_type} log file {f}: {e}")
+
+    def _purge_instance_logs(self, model_instance_id: int):
+        """删除该实例的全部服务日志"""
+        try:
+            log_dir = Path(self._serve_log_dir)
+            for f in log_dir.glob(f"{model_instance_id}.*.log"):
+                try:
+                    f.unlink()
+                    logger.info(f"Deleted serve log file: {f}")
+                except Exception as e:
+                    logger.warning(f"Failed to delete serve log file {f}: {e}")
+        except Exception as e:
+            logger.error(
+                f"Failed to purge logs for model instance {model_instance_id}: {e}"
+            )
+
+    def _update_model(self, id: int, **kwargs):
+        """
+        将运行后发现的元信息保存到 Model
+        """
+
+        try:
+            m_public = self._clientset.models.get(id=id)
+
+            m = ModelUpdate(**m_public.model_dump())
+            for key, value in kwargs.items():
+                set_attr(m, key, value)
+
+            self._clientset.models.update(id=id, model_update=m)
+        except NotFoundException:
+            logger.warning(f"Model with ID {id} not found when trying to update.")
 
 
 def is_ready(

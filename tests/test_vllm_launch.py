@@ -67,7 +67,7 @@ def launch_server(tmp_path, monkeypatch):
         model.update(model_changes or {})
         writes = []
         def request(request):
-            if request.method == "PUT":
+            if request.method in {"PUT", "PATCH"}:
                 body = json.loads(request.content)
                 writes.append(body)
                 if "/model-instances/" in request.url.path:
@@ -222,6 +222,7 @@ def test_ports_and_spawn_are_idempotent_and_spawn_precedes_initializing(tmp_path
         def join(self, **kwargs):pass
     manager = ServeManager(lambda: 1, lambda: SimpleNamespace(headers={}), cfg)
     manager._inference_backend_manager = InferenceBackendManager(None)
+    monkeypatch.setattr(manager, "_start_container_log_persistence", lambda mi: None)
     monkeypatch.setattr(manager, "_get_model", lambda instance: SimpleNamespace(backend="vLLM"))
     monkeypatch.setattr(serve_module.multiprocessing, "Process", Process)
     monkeypatch.setattr(serve_module.registration, "determine_default_registry", lambda *args: None)
@@ -242,6 +243,7 @@ def test_failed_spawn_releases_port_reservation(tmp_path, monkeypatch):
     raw.update({"state": "scheduled", "port": None, "ports": []})
     manager = ServeManager(lambda: 1, lambda: SimpleNamespace(headers={}), Config(data_dir=str(tmp_path)))
     manager._inference_backend_manager = InferenceBackendManager(None)
+    monkeypatch.setattr(manager, "_start_container_log_persistence", lambda mi: None)
     patches = []
     class Process:
         def __init__(self, **kwargs):pass

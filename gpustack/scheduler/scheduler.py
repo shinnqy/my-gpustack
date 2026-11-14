@@ -43,6 +43,8 @@ import json
 from gpustack.policies.utils import should_skip_gpu_count_check
 from gpustack.utils.math import largest_power_of_2_leq
 from sqlalchemy.orm.attributes import flag_modified
+from gpustack.schemas.models import DistributedServerCoordinateModeEnum
+from gpustack.schemas.models import DistributedServers
 
 
 logger = logging.getLogger(__name__)
@@ -292,6 +294,8 @@ class Scheduler:
                 model_instance.gpu_indexes = []
                 model_instance.gpu_addresses = []
                 model_instance.computed_resource_claim = None
+                """为了将主从候选保存到模型实例"""
+                model_instance.distributed_servers = None
                 if state_message != "":
                     model_instance.state_message = state_message
 
@@ -316,6 +320,19 @@ class Scheduler:
                 model_instance.gpu_type = candidate.gpu_type
                 model_instance.gpu_indexes = candidate.gpu_indexes
                 model_instance.gpu_addresses = candidate.gpu_addresses
+                """
+                实例记录：多台机器共同服务一个 ModelInstance
+                    - 所以比如两台机器参与一次分布式推理时，数据库中仍然是一条模型实例记录
+                """
+                model_instance.distributed_servers = DistributedServers(
+                    subordinate_workers=candidate.subordinate_workers,
+                )
+                if get_backend(model) in (
+                    BackendEnum.VLLM, BackendEnum.ASCEND_MINDIE, BackendEnum.SGLANG
+                ):
+                    model_instance.distributed_servers.mode = (
+                        DistributedServerCoordinateModeEnum.INITIALIZE_LATER
+                    )
 
                 await ModelInstanceService(session).update(model_instance)
 

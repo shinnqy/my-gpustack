@@ -273,6 +273,7 @@ def _is_primary_instance_model_file(
 async def ensure_instance_model_file(session: AsyncSession, instance: ModelInstance):
     """
     整个准备模型文件过程的入口
+        - 为每台从属机器也建一条 ModelFile，各自下载
     """
     if instance.worker_id is None:
         # Not scheduled yet
@@ -791,11 +792,11 @@ async def _promote_to_starting_if_complete(
     # a None snapshot, which crashes the worker on Path(None).
     if not instance.resolved_path:
         instance.resolved_path = _first_resolved_path(
-            loaded.model_files, exclude_lora=True
+            [file for file in loaded.model_files if file.worker_id == instance.worker_id], exclude_lora=True
         )
     if instance.draft_model_source and not instance.draft_model_resolved_path:
         instance.draft_model_resolved_path = _first_resolved_path(
-            loaded.draft_model_files
+            [file for file in loaded.draft_model_files if file.worker_id == instance.worker_id]
         )
     instance.state = ModelInstanceStateEnum.STARTING
     return True
@@ -925,7 +926,7 @@ async def _sync_subordinate_worker(
     file: ModelFile,
 ) -> bool:
     """
-    更新某个从属 Worker 的进度；文件就绪时检查整体完成情况，失败时将实例设为 ERROR。
+    [$14 多机多卡] 更新某个从属 Worker 的进度；文件就绪时检查整体完成情况，失败时将实例设为 ERROR。
     """
     if file.state == ModelFileStateEnum.DOWNLOADING:
         if file.download_progress == subordinate.download_progress:
@@ -938,13 +939,16 @@ async def _sync_subordinate_worker(
         # READY event must still re-check completion — gating on the progress
         # value would skip the STARTING transition and stick at 100%.
         need_update = subordinate.download_progress != 100
-        subordinate.download_progress = 100
+        worker_id = subordinate.worker_id
         if instance.state in (
             ModelInstanceStateEnum.DOWNLOADING,
             ModelInstanceStateEnum.INITIALIZING,
         ):
             if await _promote_to_starting_if_complete(session, instance):
                 need_update = True
+        # 完成检查会重新加载 JSON 列，之后再定位并更新本从属节点，避免进度被刷新覆盖。
+        subordinate = next(sw for sw in instance.distributed_servers.subordinate_workers if sw.worker_id == worker_id)
+        subordinate.download_progress = 100
         return need_update
 
     if file.state == ModelFileStateEnum.ERROR:
@@ -959,7 +963,7 @@ async def sync_distributed_model_file_state(
     session: AsyncSession, file: ModelFile, instance: ModelInstance
 ):
     """
-    找到文件对应的从属 Worker，执行同步，再标记 distributed_servers JSON 字段发生变化并保存。
+    [$14 多机多卡] 找到文件对应的从属 Worker，执行同步，再标记 distributed_servers JSON 字段发生变化并保存。
     """
 
     # Re-load to avoid identity-map conflicts with a detached caller instance.

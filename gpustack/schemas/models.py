@@ -285,14 +285,11 @@ class ModelInstanceSubordinateWorker(BaseModel):
 
 
 class DistributedServerCoordinateModeEnum(Enum):
-    # DELEGATED means that the subordinate workers' coordinate is by-pass to other framework.
+    """从属机器的协调交给别的框架，GPUStack 不管"""
     DELEGATED = "delegated"
-    # INITIALIZE_LATER means that the subordinate workers' coordinate is handled by GPUStack,
-    # all subordinate workers belong to one model instance SHOULD start after the main worker initializes.
-    # For example, Ascend MindIE/vLLM/SGLang instances need to start their subordinate workers after the main worker initializes.
+    """主机器先初始化，从属机器等主机器进入 starting 之后再启动"""
     INITIALIZE_LATER = "initialize_later"
-    # RUN_FIRST means that the subordinate workers' coordinate is handled by GPUStack,
-    # all subordinate workers belong to one model instance MUST get ready before the main worker starts.
+    """从属机器全部就绪后主机器才启动"""
     RUN_FIRST = "run_first"
 
 
@@ -403,7 +400,7 @@ class ModelInstanceBase(SQLModel, ModelSource):
 
     backend_version: Optional[str] = None
 
-    """这里的 server 指参与推理的服务进程，不是管理 Worker 的 GPUStack Server"""
+    """[$14 多机多卡] 这里的 server 指参与推理的服务进程，不是管理 Worker 的 GPUStack Server"""
     distributed_servers: Optional[DistributedServers] = Field(
         sa_column=Column(pydantic_column_type(DistributedServers)), default=None
     )

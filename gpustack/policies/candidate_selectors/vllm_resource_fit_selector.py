@@ -29,6 +29,12 @@ from typing import List
 from typing import Optional
 from typing import Tuple
 import logging
+from collections import defaultdict
+from gpustack.policies.utils import sort_workers_by_gpu_count
+from gpustack.schemas.models import ModelInstanceSubordinateWorker
+from gpustack.utils.command import resolve_executor_backend
+from gpustack.utils.vllm_topology import validate_multinode_topology
+from gpustack.policies.candidate_selectors.base_candidate_selector import RequestEstimateUsage
 
 
 logger = logging.getLogger(__name__)
@@ -263,6 +269,10 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
 
         # Initialize model parameters.
         await self._init_model_parameters(workers)
+        explicit_tp = parse_user_parallelism(self._model.backend_parameters).tp
+        if explicit_tp and not self._is_tp_size_divisible(explicit_tp):
+            self._messages.append(f"Tensor parallel size {explicit_tp} does not divide the model attention heads or vocabulary")
+            return []
 
         self._vram_claim = await estimate_model_vram(
             self._model, self._config.huggingface_token, workers
@@ -290,11 +300,15 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
         )
 
         candidate_functions = [
+            self.find_manual_gpu_selection_candidates,
             self.find_single_worker_single_gpu_full_offloading_candidates,
             self.find_single_worker_multi_gpu_full_offloading_candidates,
+            self.find_multi_worker_multi_gpu_candidates,
         ]
 
         for candidate_func in candidate_functions:
+            if self.should_skip_candidate_func(candidate_func):
+                continue
             logger.debug(
                 f"model {self._model.readable_source}, filter candidates with resource fit selector: {candidate_func.__name__}"
             )
@@ -578,3 +592,352 @@ class VLLMResourceFitSelector(ScheduleCandidatesSelector):
         )
 
         return []
+
+    def find_manual_gpu_selection_candidates(
+        self, workers: List[Worker]
+    ) -> List[ModelInstanceScheduleCandidate]:
+        """
+        在用户指定的 GPU 范围内，先尝试单机部署，再尝试多机部署，生成符合资源要求的候选
+        """
+
+        """判断是否指定了具体 GPU"""
+        if not self._selected_gpu_workers:
+            return []
+        """优先尝试在单台 Worker 上满足要求"""
+        local = (
+            self.find_single_worker_single_gpu_full_offloading_candidates(workers)
+            or self.find_single_worker_multi_gpu_full_offloading_candidates(workers)
+        )
+        if local or len(self._selected_gpu_workers) == 1:
+            return local
+        """需要跨机器时，检查是否允许分布式推理"""
+        if not self._model.distributed_inference_across_workers:
+            self._event_collector.add(
+                EventLevelEnum.INFO, EVENT_ACTION_MANUAL_MULTI,
+                "Multi-worker GPU selection requires distributed_inference_across_workers.",
+            )
+            return []
+
+        """按 GPU 类型分组，只保留用户指定的卡"""
+        for gpu_type, group in group_workers_by_gpu_type(workers).items():
+            selected_workers = []
+            for worker in group:
+                if not worker.status or not worker.status.gpu_devices:
+                    continue
+                selected = [gpu for gpu in worker.status.gpu_devices if self._gpu_is_selected(worker, gpu)]
+                if not selected:
+                    continue
+                view = worker.model_copy()
+                view.status = worker.status.model_copy(update={"gpu_devices": selected})
+                allocatable = self.get_worker_allocatable_resource(view, gpu_type)
+                """
+                if RAM不足 or 任意所选GPU不满足要求:
+                    break
+                """
+                if ram_not_enough(self._ram_claim, allocatable) or any(
+                    not gpu.memory or not gpu.memory.total
+                    or allocatable.vram.get(gpu.index, 0) < int(gpu.memory.total * self._gpu_memory_utilization)
+                    for gpu in selected
+                ):
+                    break
+                selected_workers.append(view)
+            else:
+                if len(selected_workers) < 2:
+                    continue
+                """检查总卡数，必要时截取，再检查总显存"""
+                total_gpus = sum(len(worker.status.gpu_devices) for worker in selected_workers)
+                if self._gpu_count and total_gpus < self._gpu_count:
+                    continue
+                if self._gpu_count and total_gpus > self._gpu_count:
+                    remaining = self._gpu_count
+                    subset = []
+                    for worker in selected_workers:
+                        if remaining == 0:
+                            break
+                        view = worker.model_copy()
+                        gpus = worker.status.gpu_devices[:remaining]
+                        view.status = worker.status.model_copy(update={"gpu_devices": gpus})
+                        subset.append(view)
+                        remaining -= len(gpus)
+                    selected_workers = subset
+                total_vram = sum(
+                    int(gpu.memory.total * self._gpu_memory_utilization)
+                    for worker in selected_workers for gpu in worker.status.gpu_devices
+                )
+                if total_vram < self._vram_claim:
+                    continue
+                candidate, reason = _create_candidate(
+                    self._model, selected_workers, self._gpu_memory_utilization
+                )
+                if candidate:
+                    return [candidate]
+                if reason:
+                    self._event_collector.add(EventLevelEnum.INFO, EVENT_ACTION_MANUAL_MULTI, reason)
+        return []
+
+    def should_skip_candidate_func(self, candidate_func) -> bool:
+        """
+        根据当前配置，决定传入的候选生成方法是否应该执行
+
+
+        | 配置                    | 手动方法 | 自动单卡 | 自动单机多卡 | 自动多机 |
+        |---                     |---      |---      |---         |---|
+        | 未指定 GPU，关闭分布式    | 跳过     | 允许    | 允许        | 跳过 |
+        | 未指定 GPU，开启分布式    | 跳过     | 允许    | 允许        | 允许 |
+        | 已指定 GPU，任意分布式设置 | 允许    | 跳过     | 跳过        | 跳过 |
+        """
+
+        """没有指定具体 GPU，就跳过手动选卡"""
+        if candidate_func == self.find_manual_gpu_selection_candidates:
+            return not self._selected_gpu_workers
+        """指定了具体 GPU，就跳过其他自动选卡方法。"""
+        if (
+            self._selected_gpu_workers
+            and candidate_func != self.find_manual_gpu_selection_candidates
+        ):
+            return True
+
+        """没开分布式推理，就跳过自动多机选卡"""
+        if (
+            not self._model.distributed_inference_across_workers
+            and candidate_func == self.find_multi_worker_multi_gpu_candidates
+        ):
+            return True
+
+        return False
+
+    def find_multi_worker_multi_gpu_candidates(
+        self, workers: List[Worker]
+    ) -> List[ModelInstanceScheduleCandidate]:
+        """
+        单机多卡也不行的时候，这个方法来选出一组机器
+        """
+        candidates = []
+        workers_of_type = group_workers_by_gpu_type(workers)
+        for gpu_type, workers_of_type in workers_of_type.items():
+            result = self.auto_select_multi_worker_multi_gpu_candidates(
+                workers_of_type, gpu_type
+            )
+            if result:
+                candidates.extend(result)
+
+        return candidates
+
+    def auto_select_multi_worker_multi_gpu_candidates(  # noqa: C901
+        self, workers: List[Worker], gpu_type: Optional[str] = None
+    ) -> List[ModelInstanceScheduleCandidate]:
+        """
+        自动选择多机候选，
+        一个候选需要满足:
+        1. 每台机器卡数相同：Ray 模式下 GPUStack 的默认切法是“机器内张量并行、机器间流水线并行”，即 TP = 每台卡数、PP = 机器数。卡数不同就切不平。
+        2. 每台机器的每张卡都满足 GMU：多机部署会用满每台机器的所有卡（第 11 章说过 vLLM 会占住 90%），一张卡被别的实例占了，这台机器就不能用。
+        3. 每台卡数能整除注意力头数：它就是 TP。
+        4. 总量 ≥ 估算值。
+        5. 用户写了并行度：凑够 tp × pp 张卡为止。
+
+        做法：按卡数把机器分组（ sort_workers_by_gpu_count 先按卡数从多到少排序，卡多的机器优先，机器数就少），在每组里逐台加入，直到总量够。
+            - 它采用逐台累加的贪心策略，每种 GPU 类型找到第一个可行组合就返回。
+        """
+
+        if not workers or len(workers) < 2:
+            return []
+
+        """
+        先按“每台机器有几张卡”分组
+            - 上层调用已经按 cuda、`rocm` 等 GPU 类型分组；这里进一步按卡数分组，例如：
+                ```
+                8 卡组：[Worker-A, Worker-B]
+                4 卡组：[Worker-C, Worker-D, Worker-E]
+                2 卡组：[Worker-F]
+                ```
+        """
+        sort_workers_by_gpu_count(workers)
+
+        workers_by_gpu_count_dict = defaultdict(list)
+        for worker in workers:
+            if not worker.status or not worker.status.gpu_devices:
+                continue
+
+            workers_by_gpu_count_dict[len(worker.status.gpu_devices)].append(worker)
+
+        # Store the optimal combination info to show
+        workers_combination: List[Worker] = []
+        largest_vram = 0
+        worker_count = 0
+        device_count_per_worker = 0
+
+        event_message = ListMessageBuilder([])
+        seen_skip_reasons: set[str] = set()
+
+        # Loop through worker groups with the same number of GPUs.
+        for gpu_count, worker_group in workers_by_gpu_count_dict.items():
+            if len(worker_group) < 2:
+                continue
+
+            """
+            检查这组卡数是否满足 TP 整除约束
+
+            例如模型有 40 个注意力头：
+                每台 8 卡：40 % 8 == 0，继续
+                每台 6 卡：40 % 6 != 0，跳过整组
+            """
+            if not self._is_tp_size_divisible(gpu_count):
+                continue
+
+            selected_workers: List[Worker] = []
+            gpu_sum = 0
+            vram_sum = 0
+            for worker in worker_group:
+                allocatable = self.get_worker_allocatable_resource(worker, gpu_type)
+
+                if ram_not_enough(self._ram_claim, allocatable):
+                    # The RAM resource(for extended KV cache) is required per worker.
+                    # Skip the worker if it does not satisfy the RAM requirement.
+                    continue
+
+                if any(
+                    gpu.memory is None
+                    or gpu.memory.total is None
+                    or (
+                        allocatable.vram.get(gpu.index, 0) / gpu.memory.total
+                        < self._gpu_memory_utilization
+                    )
+                    for gpu in worker.status.gpu_devices
+                ):
+                    # Skip the worker if any GPU does not satisfy the gpu_memory_utilization requirement.
+                    continue
+                """将合格机器加入组合，累计卡数和显存预算。"""
+                selected_workers.append(worker)
+                gpu_sum += gpu_count
+                vram_sum += sum(
+                    int(gpu.memory.total * (self._gpu_memory_utilization or 1))
+                    for gpu in worker.status.gpu_devices
+                )
+
+                if self._gpu_count:
+                    # Parallelism is set. Proceed until we match the exact GPU count.
+                    if gpu_sum < self._gpu_count:
+                        continue
+                    elif gpu_sum > self._gpu_count:
+                        break
+
+                if vram_sum >= self._vram_claim:
+                    candidate, skip_reason = _create_candidate(
+                        self._model,
+                        selected_workers,
+                        self._gpu_memory_utilization,
+                    )
+                    if candidate is None:
+                        if skip_reason and skip_reason not in seen_skip_reasons:
+                            seen_skip_reasons.add(skip_reason)
+                            event_message.append(skip_reason)
+                        continue
+                    return [candidate]
+            if vram_sum > largest_vram:
+                workers_combination = selected_workers
+                largest_vram = vram_sum
+                worker_count = len(worker_group)
+                device_count_per_worker = gpu_count
+
+        # Nothing can be return, construct scheduling message
+        if self._gpu_memory_utilization == 0:
+            event_message.append(
+                f"The largest available worker has {byte_to_gib(largest_vram)} GiB of VRAM."
+            )
+        elif workers_combination:
+            worker_names = [worker.name for worker in workers_combination]
+            worker_names_msg = (
+                str(worker_names[:3]).rstrip("]")
+                + f"...(more {len(worker_names) - 3})]"
+                if len(worker_names) > 3
+                else str(worker_names)
+            )
+            message = f"The optimal combination {worker_names_msg} provides {byte_to_gib(largest_vram)} GiB of allocatable VRAM."
+            if worker_count - len(workers_combination) > 0:
+                message += f" There are {worker_count - len(workers_combination)} {'workers' if worker_count - len(workers_combination) > 1 else 'worker'} that can provide {device_count_per_worker} {'GPUs' if device_count_per_worker > 1 else 'GPU'}, as the workers in the combination, but some GPUs among them fail to meet requirements."
+            event_message.append(message)
+
+        event_message.append(
+            "Cannot find a suitable worker combination to run the model in distributed mode. "
+            "If you are confident that the resources are sufficient, you may manually schedule the model by selecting the workers and GPUs."
+        )
+        self._event_collector.add(
+            EventLevelEnum.INFO,
+            EVENT_ACTION_AUTO_MULTI_WORKER_MULTI_GPU,
+            str(event_message),
+        )
+
+        return []
+
+
+def _create_candidate(
+    model: Model,
+    selected_workers: List[Worker],
+    gpu_memory_utilization: float = 0.9,
+) -> Tuple[Optional[ModelInstanceScheduleCandidate], Optional[str]]:
+    """
+    校验多节点 MP 并行布局，然后把选中的 Worker 包装成“主 Worker + 从 Worker”的调度候选
+    """
+
+    """多节点且使用 MP 时，先校验并行布局"""
+    if len(selected_workers) > 1 and (
+        resolve_executor_backend(model.backend_parameters, model.backend_version)
+        == "mp"
+    ):
+        # 先统计每台机器参与部署的卡数
+        gpu_per_node = [len(w.status.gpu_devices or []) for w in selected_workers]
+        try:
+            validate_multinode_topology(
+                gpu_per_node, parse_user_parallelism(model.backend_parameters)
+            )
+        except ValueError as e:
+            logger.info(
+                f"Skipping worker combination {[w.name for w in selected_workers]} "
+                f"for {model.name}: {e}"
+            )
+            return None, str(e)
+
+    """IMPORTANT: Ray 和 MP 都会执行下面的代码"""
+
+    """将第一台机器设为主 Worker，计算它的资源声明"""
+    main_worker = selected_workers[0]
+    vram_claim_main = {
+        gpu.index: int(gpu.memory.total * gpu_memory_utilization)
+        for gpu in main_worker.status.gpu_devices
+    }
+    gpu_type = main_worker.status.gpu_devices[0].type
+    candidate = ModelInstanceScheduleCandidate(
+        worker=main_worker,
+        gpu_type=gpu_type,
+        gpu_indexes=[gpu.index for gpu in main_worker.status.gpu_devices],
+        computed_resource_claim=ComputedResourceClaim(
+            vram=vram_claim_main,
+            ram=get_computed_ram_claim(model, vram_claim_main),
+        ),
+    )
+    """将其他机器包装成从 Worker"""
+    candidate.subordinate_workers = []
+    for worker in selected_workers[1:]:
+        vram_claim_subworker = {
+            # 显存预算仍然按同一个公式计算
+            gpu.index: int(gpu.memory.total * gpu_memory_utilization)
+            for gpu in worker.status.gpu_devices
+        }
+        candidate.subordinate_workers.append(
+            ModelInstanceSubordinateWorker(
+                worker_id=worker.id,
+                worker_name=worker.name,
+                worker_ip=worker.ip,
+                worker_ifname=worker.ifname,
+                total_gpus=len(worker.status.gpu_devices),
+                gpu_type=gpu_type,
+                gpu_indexes=[gpu.index for gpu in worker.status.gpu_devices],
+                computed_resource_claim=ComputedResourceClaim(
+                    vram=vram_claim_subworker,
+                    ram=get_computed_ram_claim(model, vram_claim_subworker),
+                ),
+            )
+        )
+
+    """返回候选和失败原因组成的二元组"""
+    return candidate, None

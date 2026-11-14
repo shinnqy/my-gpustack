@@ -17,6 +17,7 @@ from typing import Optional
 from enum import Enum
 from dataclasses import dataclass
 import logging
+from gpustack.schemas.models import ModelInstanceSubordinateWorker
 
 
 logger = logging.getLogger(__name__)
@@ -154,6 +155,25 @@ class PlacementScorer(ScheduleCandidatesScorer, ModelInstanceScorer):
             )
             final_score = score
 
+            """
+            评分时考虑从属机器
+                - 给新候选评分时，加入从属 Worker 的资源评分。
+                - 给已有实例评分、用于缩容排序时，也考虑其从属 Worker。
+                - 新增 _score_binpack_subordinate_workers()，逐台查询从属机器的可分配资源并计算分数，再参与主从分数的加权组合。
+            """
+            if candidate.subordinate_workers:
+                subordinate_score = await self._score_binpack_subordinate_workers(
+                    candidate.subordinate_workers, self._scale_type
+                )
+                subordinate_weight = (
+                    len(candidate.subordinate_workers)
+                    * self._inference_server_type_weight.rpc_server
+                )
+                final_score = (
+                    score * self._inference_server_type_weight.server
+                    + subordinate_score * subordinate_weight
+                ) / (self._inference_server_type_weight.server + subordinate_weight)
+
             candidate.score = final_score
 
         return candidates
@@ -190,6 +210,31 @@ class PlacementScorer(ScheduleCandidatesScorer, ModelInstanceScorer):
                 self._scale_type,
             )
             final_score = score
+
+            """
+            评分时考虑从属机器
+                - 统计某台 Worker、某张 GPU 上有多少模型实例时，将从属 GPU 也计入
+            """
+            if (
+                instance.distributed_servers
+                and instance.distributed_servers.subordinate_workers
+            ):
+                subordinate_workers = instance.distributed_servers.subordinate_workers
+                subordinate_worker_score = (
+                    await self._score_binpack_subordinate_workers(
+                        subordinate_workers, self._scale_type
+                    )
+                )
+                final_score = (
+                    score * self._inference_server_type_weight.server
+                    + subordinate_worker_score
+                    * len(subordinate_workers)
+                    * self._inference_server_type_weight.rpc_server
+                ) / (
+                    self._inference_server_type_weight.server
+                    + self._inference_server_type_weight.rpc_server
+                    * len(subordinate_workers)
+                )
 
             scored_instances.append(
                 ModelInstanceScore(model_instance=instance, score=final_score)
@@ -531,7 +576,48 @@ class PlacementScorer(ScheduleCandidatesScorer, ModelInstanceScorer):
                     is_current_model,
                 )
 
+            if (
+                model_instance.distributed_servers
+                and model_instance.distributed_servers.subordinate_workers
+            ):
+                for (
+                    subordinate_worker
+                ) in model_instance.distributed_servers.subordinate_workers:
+                    for subordinate_gpu_index in subordinate_worker.gpu_indexes:
+                        update_count(
+                            worker_model_instances_count_map,
+                            subordinate_worker.worker_id,
+                            subordinate_gpu_index,
+                            is_current_model,
+                        )
+
         return worker_model_instances_count_map
+
+    async def _score_binpack_subordinate_workers(
+        self, subordinate_workers: List[ModelInstanceSubordinateWorker], scale_type: str
+    ) -> float:
+        if subordinate_workers is None:
+            return 0
+
+        async with async_session() as session:
+            workers = await Worker.all(session)
+            worker_map = {worker.id: worker for worker in workers}
+
+            score = 0
+            for subordinate_worker in subordinate_workers:
+                allocatable = get_worker_allocatable_resource(
+                    self._model_instances,
+                    worker_map.get(subordinate_worker.worker_id),
+                )
+
+                score += await self._score_binpack_item(
+                    subordinate_worker.gpu_indexes,
+                    subordinate_worker.computed_resource_claim,
+                    allocatable,
+                    scale_type,
+                )
+
+            return score
 
 
 def update_count(

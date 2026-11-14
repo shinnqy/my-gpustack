@@ -11,6 +11,7 @@ from gpustack.schemas.models import (
     ModelInstance,
 )
 from gpustack.schemas.workers import Worker
+from gpustack.schemas.models import ModelInstanceSubordinateWorker
 
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,9 @@ class ModelInstanceScheduleCandidate:
             log_entries.append("overcommit: true")
 
         return ', '.join(log_entries)
+
+    """IMPORTANT: 让调度候选携带从属 Worker"""
+    subordinate_workers: Optional[List[ModelInstanceSubordinateWorker]] = None
 
 
 @dataclass

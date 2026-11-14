@@ -50,6 +50,14 @@ def compute_worker_allocated(
                 if mi.gpu_indexes:
                     add_vram(claim)
 
+        """累计该 Worker 已分配显存时，加入从属记录中的 computed_resource_claim.vram"""
+        if mi.distributed_servers and mi.distributed_servers.subordinate_workers:
+            for sw in mi.distributed_servers.subordinate_workers:
+                if sw.worker_id == worker_id and sw.computed_resource_claim and (
+                    gpu_type is None or sw.gpu_type is None or sw.gpu_type == gpu_type
+                ):
+                    add_vram(sw.computed_resource_claim)
+
     return allocated
 
 
@@ -326,6 +334,12 @@ def get_worker_model_instances(
         if model_instance.worker_id == worker.id:
             relevant_instances.append(model_instance)
         # Check if this worker is used as a subordinate worker
+        """查询某台 Worker 关联的实例时，除了主 Worker 绑定，也查找从属列表中的绑定。"""
+        elif model_instance.distributed_servers and any(
+            sw.worker_id == worker.id
+            for sw in model_instance.distributed_servers.subordinate_workers or []
+        ):
+            relevant_instances.append(model_instance)
 
     return relevant_instances
 
@@ -490,3 +504,17 @@ def get_computed_ram_claim(
     """
     if static_ram:
         return static_ram
+
+
+def sort_workers_by_gpu_count(workers: List[Worker]):
+    """
+    按 GPU 数量原地降序排序，供多机候选选择使用。
+    """
+    workers.sort(
+        key=lambda worker: (
+            len(worker.status.gpu_devices)
+            if worker.status and worker.status.gpu_devices
+            else 0
+        ),
+        reverse=True,
+    )

@@ -12,7 +12,6 @@ from typing import Optional
 import sys
 from gpustack.server.bus import Event, EventType
 from pathlib import Path
-from gpustack.schemas.models import ModelInstanceUpdate
 from gpustack.schemas.models import ModelInstanceDeploymentMetadata
 from functools import lru_cache
 from gpustack.schemas.workers import GPUDevicesStatus
@@ -44,6 +43,8 @@ from gpustack.utils.hub import get_pretrained_config, get_hf_text_config, get_ma
 from gpustack.utils.runtime import transform_workload_plan
 import shlex
 from gpustack.utils.command import flatten_to_argv, is_parameter_key
+from gpustack.schemas.models import SourceEnum
+from gpustack.schemas.model_files import ModelFileStateEnum
 from gpustack.schemas.inference_backend import ParameterFormatEnum
 
 
@@ -179,10 +180,7 @@ class InferenceServer(ABC):
             error_message = f"Failed to initialize: {e}"
             logger.error(error_message)
             try:
-                patch_dict = {
-                    "state_message": error_message,
-                    "state": ModelInstanceStateEnum.ERROR,
-                }
+                patch_dict = self._instance_error_patch(error_message, worker_id)
                 self._update_model_instance(mi.id, **patch_dict)
             except Exception as ue:
                 logger.error(f"Failed to update model instance: {ue}")
@@ -194,13 +192,20 @@ class InferenceServer(ABC):
         instance = ModelInstance.model_validate(event.data)
         if instance.state == ModelInstanceStateEnum.ERROR:
             raise ModelInstanceStateError()
-        elif instance.state == ModelInstanceStateEnum.STARTING:
+        elif instance.state == ModelInstanceStateEnum.STARTING or (
+            instance.state == ModelInstanceStateEnum.RUNNING
+            and instance.worker_id != self._worker.id
+        ):
             resolved_path = instance.resolved_path
             if not resolved_path:
                 raise ValueError(
                     "Model instance reached STARTING without a resolved model path"
                 )
             self._model_path = str(Path(resolved_path).absolute())
+            if instance.worker_id != self._worker.id and (
+                instance.distributed_servers and instance.distributed_servers.download_model_files
+            ):
+                self._model_path = self._resolve_worker_model_path(instance, resolved_path)
             if instance.draft_model_resolved_path:
                 self._draft_model_path = str(
                     Path(instance.draft_model_resolved_path).absolute()
@@ -209,6 +214,32 @@ class InferenceServer(ABC):
             return True
 
         return False
+
+    def _resolve_worker_model_path(self, source, fallback: str) -> str:
+        """从本机文件记录解析路径"""
+
+        if source.source == SourceEnum.LOCAL_PATH:
+            return str(Path(source.local_path).absolute())
+        files = self._clientset.model_files.list(
+            params={"worker_id": self._worker.id, "page": -1}, use_cache=False,
+        )
+        ready = next((file for file in files.items or [] if (
+            file.model_source_index == source.model_source_index
+            and file.state == ModelFileStateEnum.READY and file.resolved_paths
+        )), None)
+        if ready is None:
+            raise ValueError(f"No ready model file found on worker {self._worker.id}")
+        return str(Path(ready.resolved_paths[0]).absolute())
+
+    def _instance_error_patch(self, message: str, worker_id: int) -> dict:
+        instance = self._model_instance
+        if instance.worker_id != worker_id and instance.distributed_servers:
+            position = next((i for i, sw in enumerate(instance.distributed_servers.subordinate_workers or [])
+                             if sw.worker_id == worker_id), None)
+            if position is not None:
+                prefix = f"distributed_servers.subordinate_workers.{position}"
+                return {prefix + ".state": ModelInstanceStateEnum.ERROR, prefix + ".state_message": message}
+        return {"state": ModelInstanceStateEnum.ERROR, "state_message": message}
 
     def get_model(self):
         model = self._clientset.models.get(id=self._model_instance.model_id)
@@ -263,13 +294,10 @@ exec "$@"
         )
 
     def _update_model_instance(self, id: int, **kwargs):
-        mi_public = self._clientset.model_instances.get(id=id)
-
-        mi = ModelInstanceUpdate(**mi_public.model_dump())
-        for key, value in kwargs.items():
-            setattr(mi, key, value)
-
-        self._clientset.model_instances.update(id=id, model_update=mi)
+        self._clientset.model_instances.patch(
+            id=id, updates=kwargs,
+            expected_restart_count=self._model_instance.restart_count or 0,
+        )
 
     def _handle_error(self, error: Exception):
         """
@@ -281,13 +309,8 @@ exec "$@"
         error_message = f"Failed to run {self._model.backend}: {error}{cause_text}"
 
         try:
-            is_main_worker = self._model_instance.worker_id == self._worker.id
-            if is_main_worker:
-                patch_dict = {
-                    "state_message": error_message,
-                    "state": ModelInstanceStateEnum.ERROR,
-                }
-                self._update_model_instance(self._model_instance.id, **patch_dict)
+            patch_dict = self._instance_error_patch(error_message, self._worker.id)
+            self._update_model_instance(self._model_instance.id, **patch_dict)
         except Exception as ue:
             logger.error(f"Failed to update model instance: {ue}")
 
@@ -940,6 +963,8 @@ def _cann_variant(arch_family: Optional[str]) -> Optional[str]:
 def cal_distributed_parallelism_arguments(
     model_instance: ModelInstance,
 ) -> tuple[int, int]:
+    """根据模型实例在主、从 Worker 上选中了多少张 GPU，计算一组默认的 TP、PP 数值"""
+
     pp = len(model_instance.distributed_servers.subordinate_workers) + 1
     tp = len(model_instance.gpu_indexes) if model_instance.gpu_indexes else 1
     uneven_pp = tp

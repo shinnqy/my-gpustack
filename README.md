@@ -1,6 +1,6 @@
-# My GPUStack：第十三章完成版
+# My GPUStack：第十四章完成版
 
-按 `guide/v1/01`～`13` 的正文及配套辅助代码整理。
+按 `guide/v1/01`～`14` 的正文及配套辅助代码整理。
 已具备集群、模型与实例记录、事件控制器，以及 Worker 注册、设备采集、心跳和状态批量上报。
 已接通模型和实例的 Watch 流、Worker 客户端缓存、ServeManager 订阅骨架，以及 Server 快照缓存和写入后的缓存失效。
 已接通调度器、去重队列、集群/GPU 所在 Worker/标签/就绪状态过滤，以及调度结果回写。
@@ -14,6 +14,8 @@ Spread/Binpack 放置评分，以及缩容评分链。
 文件准备完成后，启动子进程创建推理容器并结束初始化；容器运行且就绪检查通过后，实例进入 `running`。
 已接通按模型名选择实例的 OpenAI 兼容接口、轮询负载均衡、Server 到 Worker 再到推理引擎的两跳代理，
 支持普通 JSON、SSE 流式响应、二进制响应和表单文件上传。
+已接通多机候选选择、从属 GPU 资源记账、各 Worker 的文件就绪同步、主从启动与状态协调，
+以及 vLLM 的 Ray 和 MP 多机工作负载计划。
 
 ## 安装与启动
 
@@ -384,6 +386,68 @@ Worker 验证令牌后，只向本机 `running` 实例转发，记录成功请�
 当前实现的是 `worker` 两跳模式；`direct`、`tunnel`、Higress 网关和专用 `/rerank` 路由不在本章范围。
 具体模型是否支持音频、图像等接口，由其推理引擎决定。
 
+## 第十四章检查点
+
+先启动 Server，再在两台 GPU 机器上执行上文的 Worker 启动命令，使用同一集群的注册令牌。
+可分别加 `--worker-name gpu-1` 和 `--worker-name gpu-2`，确认 `/v2/workers` 中两台机器均为 `ready`，
+且 `status.gpu_devices` 包含实际设备。宿主机不需要单独安装 Ray，推理镜像需要包含所选的执行后端。
+
+机器之间需要互通 Worker API 端口（默认 10150）、服务端口段（默认 40000–40063），
+Ray 模式还需要互通 Ray 端口段（默认 41000–41999）。
+Ray 模式要求各机器上的模型绝对路径一致：配置相同的缓存目录位置，各自下载自己的模型文件。
+MP 模式按各自 Worker 的 ModelFile 记录查找文件，可使用不同缓存目录。
+
+下面按教材示例部署到两台各一张卡的机器上；请按实际显存选择模型：
+
+```bash
+curl -s -X POST http://127.0.0.1:30080/v2/models \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"qwen3-32b-2node","source":"model_scope","model_scope_model_id":"Qwen/Qwen3-32B","backend_parameters":["--tensor-parallel-size=1","--pipeline-parallel-size=2","--distributed-executor-backend=ray"]}'
+```
+
+`TP × PP = 2` 强制使用两张卡；两台机器都只有一张卡时会选择多机组合。
+自动选择依次尝试单卡、单机多卡、多机多卡；多机自动选择要求 GPU 类型和每台参与卡数相同，
+每张卡满足显存预算，总预算足够，并符合 TP 整除及 MP 拓扑约束。
+`distributed_inference_across_workers=false` 时不选择多机；显式选卡支持跨 Worker。
+从属卡的资源声明也计入账本，避免后续实例重复占用。
+
+查询实例和文件记录：
+
+```bash
+curl -s http://127.0.0.1:30080/v2/model-instances | python -m json.tool
+curl -s http://127.0.0.1:30080/v2/model-files | python -m json.tool
+```
+
+应看到一个实例：`worker_id` 指向主机器，`distributed_servers.mode=initialize_later`，
+`subordinate_workers` 中有另一台机器的 GPU、资源声明、进度、PID 和状态。
+同一个来源在两台 Worker 上各有一条 ModelFile，全部主模型和草稿文件就绪后才进入 `starting`。
+
+Worker 根据自己的角色启动工作负载：
+
+- Ray 主机器运行 vLLM 和 `ray-head` 两个容器，共享 `/tmp` 卷；从属工作负载名以 `-f0` 结尾，执行 `ray start --address=<主机器IP>:41000`。
+- MP 模式每台机器运行 vLLM，按拓扑生成 `--nnodes`、`--node-rank`、主地址、主端口以及所需 DP 参数；从属进程使用 `--headless`。
+- NVIDIA 配置 NCCL/Gloo 网卡；昇腾配置 HCCL/Gloo 网卡。用户明确指定的通信配置保留。
+
+Ray 主机器上执行 `docker exec RAY_HEAD_CONTAINER ray status`，应能看到两个 Ray 节点。
+主实例只有在从属节点状态正常、主容器运行并通过 HTTP 就绪检查后才进入 `running`。
+从属节点的 `running` 表示其启动流程已接手；最终推理就绪仍由主机器的引擎检查决定。
+随后可以通过第十三章的 `/v1/chat/completions` 请求 `qwen3-32b-2node`。
+
+验证 MP 时，释放前一个模型的资源，再将请求中的 `--distributed-executor-backend=ray` 改为 `mp`，
+并选择支持这些多机参数的 vLLM 版本和镜像。支持 TP/PP、纯 DP 和 DP 嵌套 TP/PP 三种拓扑。
+程序根据显式参数或 `backend_version` 选择执行后端；本项目当前默认规则中，带 `-custom` 且版本达到 0.18.0 时默认 MP，其余默认 Ray。
+MP 端口布局为 HTTP、DP RPC、PyTorch master、VLLM_PORT、连接端口，并为 DP 主端口预留连续十个端口。
+
+停止从属工作负载后，应先看到其状态和错误原因写入 `subordinate_workers`，
+主实例随之进入 `error`，随后按第十二章的退避规则整体重启主从工作负载。
+短暂停止 Worker 进程会标记从属节点和实例 `unreachable`；恢复 Worker 后可复用仍存在的工作负载。
+删除模型后，两台 Worker 都会收割各自的工作负载。
+
+主从状态通过字段补丁更新，Server 合并嵌套字段并校验 `restart_count`，避免并发回写互相覆盖，
+也避免旧启动进程修改新一轮重启的数据。
+每台 Worker 的 `<data-dir>/log/serve` 保存启动日志和容器日志，Ray head 日志如 `1.container.ray-head.0.log`；
+重启时保留当前和上一轮，删除实例时清理这些日志。
+
 ## 本地验证
 
 ```bash
@@ -412,4 +476,10 @@ OpenAI 错误格式、状态码透传、超时、重复响应头、自动解压�
 分块上传不等待完整请求体、流式数据保真、提前到达、数据库会话释放和断连清理。
 第十三章独立进程检查使用模拟 Runtime，验证两个副本的就绪与轮询、OpenAI SDK 流式文本和用量、
 Worker 认证，以及缩容清理后的 503 响应，不拉取模型或推理镜像。
+多机测试覆盖自动与手动选卡、设备类型和状态过滤、从属资源扣减、调度结果持久化、
+多 Worker 文件就绪、并发补丁与旧重启保护、主从启动协调、从属故障传播、日志轮转，
+以及 Ray 和三类 MP 拓扑的主从命令、设备资源、通信环境和端口预留。
+第十四章独立 Server、两台 Worker 进程检查使用 SQLite、模拟 GPU/Runtime 和本地 HTTP 引擎替身，
+验证 Ray/MP 两条链路、每 Worker 的文件记录、两跳请求、整体故障恢复、从属失联重连和双方清理。
+上述检查不会启动真实 Ray/vLLM 或测试 NCCL/HCCL 通信，真实多机推理需在对应设备上验收。
 生产启动仍使用 PostgreSQL；真实 GPU/NPU 驱动采集需要在对应机器上验证。

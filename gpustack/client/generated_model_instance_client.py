@@ -4,6 +4,7 @@ import json
 import logging
 import threading
 from typing import Any, Callable, Dict, Optional, Union, Awaitable
+from pydantic_core import to_jsonable_python
 import httpx
 from gpustack.api.exceptions import (
     raise_if_response_error,
@@ -151,6 +152,17 @@ class ModelInstanceClient:
                     logger.trace(f"Cache: updated modelinstance {item.id}")
         except Exception as e:
             logger.error(f"Failed to update model-instances cache from event: {e}")
+
+    def patch(self, id: int, updates: Dict[str, Any], expected_restart_count: Optional[int] = None) -> ModelInstancePublic:
+        """
+        让 Worker 可以局部更新实例
+        """
+        response = self._client.get_httpx_client().patch(
+            f"{self._url}/{id}", json=to_jsonable_python(updates),
+            params={"expected_restart_count": expected_restart_count} if expected_restart_count is not None else None,
+        )
+        raise_if_response_error(response)
+        return ModelInstancePublic.model_validate(response.json())
 
     def watch(self, callback=None, stop_condition=None, params=None):
         """同步 Watch 入口"""
