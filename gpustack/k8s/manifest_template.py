@@ -308,13 +308,13 @@ class TemplateConfig(ClusterRegistrationTokenPublic):
         """
         daemonset.jinja => 生成：CPU 和各 GPU 厂商的 Worker DaemonSet
         """
-        with pkg_resources.path("gpustack.k8s", "") as daemon_set_path:
+        with pkg_resources.path("gpustack.k8s", "daemonset.jinja") as daemon_set_path:
             with daemon_set_path.open(encoding="utf-8") as f:
                 daemon_set_data = f.read()
         """
         operator.jinja => 生成：Operator 安装所需的权限、ConfigMap、Job、所有者 Namespace
         """
-        with pkg_resources.path("gpustack.k8s", "") as operator_path:
+        with pkg_resources.path("gpustack.k8s", "operator.jinja") as operator_path:
             with operator_path.open(encoding="utf-8") as f:
                 operator_data = f.read()
         env = jinja2.Environment()
