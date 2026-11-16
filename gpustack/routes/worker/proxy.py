@@ -35,6 +35,26 @@ router = APIRouter(dependencies=[Depends(worker_auth)])
 logger = logging.getLogger(__name__)
 
 
+class ModelInstanceRoutingMiddleware:
+    """Worker 处理请求的中间件：只改写路由信息，直接传递 ASGI 流，保留断流错误和背压。"""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        request = Request(scope, receive)
+
+        async def forward(request):
+            await self.app(request.scope, receive, send)
+
+        response = await set_port_from_model_name(request, forward)
+        if response is not None:
+            await response(scope, receive, send)
+
+
 def _filter_response_headers(resp_headers) -> List[Tuple[str, str]]:
     # Return a list of tuples (not a dict) so multi-value headers such as
     # Set-Cookie are preserved; aiohttp's CIMultiDictProxy emits one item per

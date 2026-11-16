@@ -13,6 +13,7 @@ from typing import Dict
 from gpustack.config.registration import read_registration_token
 from gpustack.config.registration import read_worker_token
 from pydantic import model_validator
+from gpustack import __operator_version__
 
 
 _config = None
@@ -229,6 +230,12 @@ class Config(WorkerConfig, BaseSettings):
         system_reserved_in_bytes["ram"] = int(ram) << 30
         system_reserved_in_bytes["vram"] = int(vram) << 30
         return system_reserved_in_bytes
+
+    """服务端默认 Operator 镜像"""
+    operator_image: str = f"gpustack/gpustack-operator:{__operator_version__}"
+
+    """服务端默认命名空间"""
+    namespace: str = "gpustack-system"
 
 
 def get_image_name(

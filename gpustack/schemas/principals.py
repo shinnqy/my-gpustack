@@ -1,0 +1,1 @@
+PLATFORM_PRINCIPAL_NAME = 'default'

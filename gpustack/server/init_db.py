@@ -59,6 +59,7 @@ async def create_db_and_tables(engine: AsyncEngine):
     async with engine.begin() as conn:
         await conn.run_sync(_upgrade_model_instance_columns)
         await conn.run_sync(_upgrade_worker_columns)
+        await conn.run_sync(_upgrade_cluster_columns)
         await conn.run_sync(
             SQLModel.metadata.create_all,
             tables=[
@@ -71,6 +72,19 @@ async def create_db_and_tables(engine: AsyncEngine):
                 ModelInstanceDraftModelFileLink.__table__,
             ],
         )
+
+
+def _upgrade_cluster_columns(connection):
+    """为已有集群补齐 Kubernetes 选项，保留集群和注册令牌。"""
+    inspector = inspect(connection)
+    table = Cluster.__table__
+    if not inspector.has_table(table.name):
+        return
+    existing = {column["name"] for column in inspector.get_columns(table.name)}
+    if "k8s_options" not in existing:
+        declaration = str(CreateColumn(table.c.k8s_options).compile(dialect=connection.dialect))
+        table_name = connection.dialect.identifier_preparer.quote(table.name)
+        connection.exec_driver_sql(f"ALTER TABLE {table_name} ADD COLUMN {declaration}")
 
 
 def _upgrade_model_instance_columns(connection):

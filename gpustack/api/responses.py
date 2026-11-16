@@ -1,4 +1,6 @@
 import logging
+import asyncio
+import aiohttp
 
 from fastapi import status
 from fastapi.responses import StreamingResponse
@@ -53,14 +55,22 @@ class StreamingResponseWithStatusCode(StreamingResponse):
                     "more_body": True,
                 })
             await send({"type": "http.response.body", "body": b"", "more_body": False})
-        except OSError:
-            # 客户端断开时交给 Starlette 处理，同时在 finally 关闭上游。
-            raise
-        except Exception:
+        except Exception as error:
+            # 发送端断开由 Starlette 处理；上游连接/超时错误仍需返回代理状态码。
+            if isinstance(error, OSError) and not isinstance(error, (asyncio.TimeoutError, aiohttp.ClientError)):
+                raise
             logger.exception("Error while streaming response")
-            body = self._error_body(status.HTTP_500_INTERNAL_SERVER_ERROR, "InternalServerError")
+            # Kubernetes watch/protobuf 使用原始字节流；中途失败应断开，不能插入 SSE 数据。
+            if started and self.media_type != "text/event-stream":
+                raise
+            code, error_type = status.HTTP_500_INTERNAL_SERVER_ERROR, "InternalServerError"
+            if isinstance(error, asyncio.TimeoutError):
+                code, error_type = status.HTTP_504_GATEWAY_TIMEOUT, "GatewayTimeout"
+            elif isinstance(error, aiohttp.ClientError):
+                code, error_type = status.HTTP_503_SERVICE_UNAVAILABLE, "ServiceUnavailable"
+            body = self._error_body(code, error_type)
             if not started:
-                self.status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+                self.status_code = code
                 await send({
                     "type": "http.response.start",
                     "status": self.status_code,
@@ -80,8 +90,8 @@ class StreamingResponseWithStatusCode(StreamingResponse):
     @staticmethod
     def _error_body(code, error_type):
         return OpenAIAPIErrorResponse(error=OpenAIAPIError(
-            message="Service unavailable. Please retry your requests after a brief wait."
-            if code == 503 else "Internal server error.",
+            message={503: "Service unavailable. Please retry your requests after a brief wait.",
+                     504: "Gateway request timed out."}.get(code, "Internal server error."),
             code=code,
             type=error_type,
         )).model_dump_json().encode()

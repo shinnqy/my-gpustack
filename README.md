@@ -1,6 +1,6 @@
-# My GPUStack：第十四章完成版
+# My GPUStack：第十五章完成版
 
-按 `guide/v1/01`～`14` 的正文及配套辅助代码整理。
+按 `guide/v1/01`～`15` 的正文及配套辅助代码整理。
 已具备集群、模型与实例记录、事件控制器，以及 Worker 注册、设备采集、心跳和状态批量上报。
 已接通模型和实例的 Watch 流、Worker 客户端缓存、ServeManager 订阅骨架，以及 Server 快照缓存和写入后的缓存失效。
 已接通调度器、去重队列、集群/GPU 所在 Worker/标签/就绪状态过滤，以及调度结果回写。
@@ -16,6 +16,8 @@ Spread/Binpack 放置评分，以及缩容评分链。
 支持普通 JSON、SSE 流式响应、二进制响应和表单文件上传。
 已接通多机候选选择、从属 GPU 资源记账、各 Worker 的文件就绪同步、主从启动与状态协调，
 以及 vLLM 的 Ray 和 MP 多机工作负载计划。
+已接通 Kubernetes 集群选项和部署清单、经 Worker 的 Kubernetes API 代理，
+以及 Server 侧 operator worker gateway 子进程、TLS Unix socket 客户端和集群订阅协调。
 
 ## 安装与启动
 
@@ -448,6 +450,84 @@ MP 端口布局为 HTTP、DP RPC、PyTorch master、VLLM_PORT、连接端口，�
 每台 Worker 的 `<data-dir>/log/serve` 保存启动日志和容器日志，Ray head 日志如 `1.container.ray-head.0.log`；
 重启时保留当前和上一轮，删除实例时清理这些日志。
 
+## 第十五章检查点
+
+Server 仍按上文使用 PostgreSQL 启动。准备可用的 Kubernetes 集群、NFD 和对应厂商的驱动/设备运行时。
+Server 必须能访问 Worker 节点的 API 端口（默认 10150），Worker Pod 也必须能访问 Server。
+当前通过 Worker 固定端口直连，未接入 NAT 隧道。
+
+如需 Server 侧 operator 网关，在 Server 的 PATH 中提供匹配操作系统和架构的 `gpustack-operator`
+二进制，或使用包含该二进制的 Server 镜像。当前默认 operator 镜像版本为 `v0.8.5`。
+找不到二进制时，Server 跳过网关子进程和订阅，已有 Docker 功能仍可使用。
+
+创建 Kubernetes 集群，使用 Kubernetes 节点可访问的 Server 地址：
+
+```bash
+curl -s -X POST http://127.0.0.1:30080/v2/clusters \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"k8s-a","provider":"Kubernetes","server_url":"http://SERVER_IP:30080","worker_config":{"image_name_override":"REGISTRY/my-gpustack:chapter15"}}'
+```
+
+将 `image_name_override` 替换为已发布、包含本项目及 Worker 运行依赖的镜像。
+教学项目的版本号为 `0.0.0`，生成的默认 Worker 镜像标签不能直接当作已有发布镜像使用。
+`k8s_options` 支持 `namespace`、`nodeSelector`、`imageCredentials`、`volumeMounts`、`operatorImage` 和 `operator.env`。
+省略挂载时默认使用宿主机 `/var/lib/gpustack`；第一项始终挂到容器的 `/var/lib/gpustack`，用于持久化模型缓存。
+可修改第一项的宿主机目录，后续挂载可使用本章定义的 hostPath、PVC 或 ConfigMap。
+
+用创建结果中的 ID 替换 `CLUSTER_ID`，下载清单：
+
+```bash
+curl -fsS 'http://127.0.0.1:30080/v2/clusters/CLUSTER_ID/manifests?runtime=nvidia' > gpustack-k8s.yaml
+kubectl apply -f gpustack-k8s.yaml
+kubectl -n gpustack-system get ds,job,deploy,pods -o wide
+```
+
+昇腾使用 `runtime=ascend`，多厂商可重复传参，如 `runtime=nvidia&runtime=ascend`。
+CPU DaemonSet 始终渲染，只选择 `feature.gpustack.ai/acceleratable=false` 的节点；
+GPU DaemonSet 按厂商 PCI 标签选择节点，并通过跨 DaemonSet 的反亲和配置避免同节点重复运行 Worker。
+修改命名空间时，后续 kubectl 命令也使用对应的命名空间。
+
+清单包含 Namespace、注册令牌和镜像仓库 Secret、Worker Service/ServiceAccount/RBAC、
+各厂商 Worker DaemonSet，以及 operator 的配置和安装 Job。
+安装 Job 在集群内使用 ytt/kubectl 创建 operator worker Deployment 等资源。
+Worker 的 ServiceAccount 绑定 `cluster-admin`，用于本章的集群 API 代理。
+
+Worker Pod 会以节点名注册，清单设置 `GPUSTACK_RUNTIME_DEPLOY=Kubernetes` 和镜像部署模式。
+在 `/v2/workers` 确认对应 `cluster_id` 的 Worker 为 `ready` 后，指定该集群创建模型：
+
+```bash
+curl -s -X POST http://127.0.0.1:30080/v2/models \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"k8s-qwen","cluster_id":CLUSTER_ID,"source":"model_scope","model_scope_model_id":"Qwen/Qwen3-0.6B"}'
+kubectl -n gpustack-system get pods -o wide
+```
+
+Worker 仍创建通用 Runtime 工作负载计划，由 Kubernetes 部署器生成推理 Pod，
+继承 Worker Pod 的数据卷、环境配置和镜像拉取凭证，并固定到相应节点。
+当前 Runtime 在 operator 设备插件模式下会请求如 `nvidia.com/gpu.shared` 的资源并附带首选设备索引；
+具体资源键和注入方式取决于节点插件及 Runtime 策略，不能一律按原生 `nvidia.com/gpu` 判断。
+实例进入 `running` 后，使用第十三章的 `/v1/chat/completions` 请求模型。
+
+集群代理示例：
+
+```bash
+curl -s 'http://127.0.0.1:30080/v2/clusters/CLUSTER_ID/proxy/api/v1/nodes'
+curl -N 'http://127.0.0.1:30080/v2/clusters/CLUSTER_ID/proxy/api/v1/pods?watch=true'
+```
+
+Server 从该集群选择 ready Worker，使用其专属令牌访问 `/cluster-proxy/...`；
+Worker 验证请求后，使用 Pod 的 ServiceAccount 令牌和 CA 访问 API Server。
+令牌每次请求重新读取，支持 kubelet 轮换；watch/日志请求原样流式返回，不占用数据库会话，断开时关闭上游。
+本章 Server 管理接口仍省略用户/多租户权限检查，GPU 实例 CRUD 和 vGPU 调度入口属于后续章节。
+
+`k8s_options.gpuInstanceOptions` 存在（可为 `{}`）且至少有一台 ready Worker 时，
+Server 会把集群订阅给本机的 operator 网关；模型服务集群未设置该字段时不订阅。
+重复状态事件不会重复订阅，失去最后一台 ready Worker 时取消；失败调用由心跳重试。
+Server 退出时停止网关并清理私有 socket 目录。
+
+启动会给已有 `clusters` 表补上可空的 `k8s_options`，保留原集群、注册令牌和已有模型。
+安装包已包含四个 jinja 模板，安装后也能生成清单。
+
 ## 本地验证
 
 ```bash
@@ -482,4 +562,11 @@ Worker 认证，以及缩容清理后的 503 响应，不拉取模型或推理�
 第十四章独立 Server、两台 Worker 进程检查使用 SQLite、模拟 GPU/Runtime 和本地 HTTP 引擎替身，
 验证 Ray/MP 两条链路、每 Worker 的文件记录、两跳请求、整体故障恢复、从属失联重连和双方清理。
 上述检查不会启动真实 Ray/vLLM 或测试 NCCL/HCCL 通信，真实多机推理需在对应设备上验收。
+Kubernetes 测试覆盖多厂商清单、私有仓库 Secret、三态选项、挂载校验、旧集群表升级、
+operator 订阅/取消/重试/令牌变更、TLS Unix socket、子进程异常和退出清理。
+代理检查使用真实本地 HTTPS 连接，覆盖方法和状态码、重复查询和响应头、二进制、自动解压、
+ServiceAccount 令牌轮换、watch 断连、异常断流和数据库会话释放。
+Runtime 转 Pod 检查使用模拟节点/API，验证实际 SDK 的设备资源转换、共享内存数量和挂载继承。
+第十五章独立 Server/Worker/operator 替身进程验证注册、清单、HTTPS 集群代理、订阅状态切换和 SIGTERM 清理；
+未对真实 Kubernetes 集群执行 kubectl apply，也未部署真实 operator 或推理 Pod。
 生产启动仍使用 PostgreSQL；真实 GPU/NPU 驱动采集需要在对应机器上验证。

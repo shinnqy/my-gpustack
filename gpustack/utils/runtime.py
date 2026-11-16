@@ -12,6 +12,13 @@ def transform_workload_plan(
 ):
     """检测到 Docker 部署器可用时，将通用 WorkloadPlan 转换为 DockerWorkloadPlan ，补充 pause 等辅助镜像，并统一处理这些镜像的仓库地址"""
 
+    if envs.GPUSTACK_RUNTIME_DEPLOY.lower() == "kubernetes":
+        """明确选择 Kubernetes 时，保留通用工作负载计划，提前返回"""
+        # Kubernetes Quantity 是字符串；新客户端会拒绝整数形式的 emptyDir.sizeLimit。
+        if isinstance(workload.shm_size, int):
+            workload.shm_size = str(workload.shm_size)
+        return workload
+
     if not DockerDeployer().is_supported():
         return workload
     return DockerWorkloadPlan(

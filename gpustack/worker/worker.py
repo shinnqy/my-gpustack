@@ -31,8 +31,8 @@ from gpustack.worker.model_file_manager import ModelFileManager
 from gpustack.worker.inference_backend_manager import InferenceBackendManager
 from gpustack.worker.workload_cleaner import WorkloadCleaner
 from gpustack.routes.worker import proxy
+from gpustack.routes.worker import cluster_proxy
 from gpustack.api import exceptions
-from starlette.middleware.base import BaseHTTPMiddleware
 from gpustack.routes.worker import proxy
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -204,6 +204,9 @@ class Worker:
             try:
                 yield
             finally:
+                kube_session = getattr(app.state, "kube_api_session", None)
+                if kube_session is not None:
+                    await kube_session.close()
                 await app.state.http_client.close()
                 await app.state.http_client_no_proxy.close()
 
@@ -221,9 +224,10 @@ class Worker:
         app.state.record_successful_inference = (
             self._serve_manager.record_successful_inference
         )
-        app.add_middleware(BaseHTTPMiddleware, dispatch=proxy.set_port_from_model_name)
+        app.add_middleware(proxy.ModelInstanceRoutingMiddleware)
         app.include_router(probes.router)
         app.include_router(proxy.router)
+        app.include_router(cluster_proxy.router)
         exceptions.register_handlers(app)
 
         config = uvicorn.Config(

@@ -33,6 +33,7 @@ dependencies = [
     "packaging>=24.1",
     "openai>=1.31.1",
     "python-multipart>=0.0.17",
+    "jinja2>=3.1.4,<4",
 ]
 
 [dependency-groups]
@@ -50,3 +51,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build]
 only-include = ["gpustack"]
+
+[tool.hatch.build.targets.wheel]
+artifacts = ["gpustack/k8s/*.jinja"]

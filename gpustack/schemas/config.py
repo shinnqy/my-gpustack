@@ -55,6 +55,7 @@ class PredefinedConfig(SensitivePredefinedConfig):
     worker_ifname: Optional[str] = None
 
     worker_port: int = 10150
+    worker_metrics_port: int = 10151
 
     service_port_range: Optional[str] = "40000-40063"
 
@@ -66,6 +67,7 @@ class PredefinedConfig(SensitivePredefinedConfig):
 class PredefinedConfigNoDefaults(PredefinedConfig):
     debug: Optional[bool] = None
     worker_port: Optional[int] = None
+    worker_metrics_port: Optional[int] = None
     service_port_range: Optional[str] = None
     ray_port_range: Optional[str] = None
     image_repo: Optional[str] = None
