@@ -334,7 +334,7 @@ def get_worker_model_instances(
         if model_instance.worker_id == worker.id:
             relevant_instances.append(model_instance)
         # Check if this worker is used as a subordinate worker
-        """查询某台 Worker 关联的实例时，除了主 Worker 绑定，也查找从属列表中的绑定。"""
+        # 查询某台 Worker 关联的实例时，除了主 Worker 绑定，也查找从属列表中的绑定。
         elif model_instance.distributed_servers and any(
             sw.worker_id == worker.id
             for sw in model_instance.distributed_servers.subordinate_workers or []
