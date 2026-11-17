@@ -57,7 +57,7 @@ async def current_worker(request: Request) -> Worker:
     token = _bearer(request)
     async with async_session() as session:
         worker = await Worker.one_by_field(session, "token", token) if token else None
-    if worker is None:
+    if worker is None or worker.deleted_at is not None:
         raise ForbiddenException(message="Failed to find related worker")
     return worker
 
@@ -98,10 +98,11 @@ async def update_worker(id: int, input: WorkerUpdate):
 async def delete_worker(id: int):
     async with async_session() as session:
         worker = await Worker.one_by_id(session, id, for_update=True)
-        if worker is None or worker.deleted_at is not None:
+        if worker is None:
             raise NotFoundException(message=f"Worker {id} not found")
-        await worker.delete(session)
-        await delete_cache_by_key(WorkerService(session).get_by_id, id)
+        if worker.deleted_at is not None and worker.state == WorkerStateEnum.DELETING:
+            return
+        await WorkerService(session).request_delete(worker)
 
 
 @router.get("/{id}", response_model=WorkerPublic)
@@ -110,7 +111,7 @@ async def get_worker(id: int):
 
     async with async_session() as session:
         worker = await Worker.one_by_id(session, id)
-        if worker is None or worker.deleted_at is not None:
+        if worker is None:
             raise NotFoundException(message=f"Worker {id} not found")
         return WorkerPublic.model_validate(worker)
 
@@ -125,6 +126,18 @@ def update_worker_data(
     if existing is not None:
         # Preserve maintenance field from existing worker if not explicitly set in worker_in
         incoming_data = worker_in.model_dump()
+        target_state = WorkerStateEnum.READY
+        if existing.worker_pool_id is not None:
+            incoming_data["external_id"] = existing.external_id
+            incoming_data["name"] = existing.name
+            if existing.advertise_address:
+                incoming_data["advertise_address"] = existing.advertise_address
+            provider_config = dict(existing.provider_config or {})
+            provider_config["registered"] = True
+            incoming_data["provider_config"] = provider_config
+            if not provider_config.get("provisioning_complete"):
+                target_state = existing.state
+                incoming_data["state_message"] = existing.state_message
         if (
             incoming_data.get("maintenance") is None
             and existing.maintenance is not None
@@ -136,11 +149,11 @@ def update_worker_data(
                 **existing.model_dump(),
                 **incoming_data,
                 "labels": {
-                    **existing.labels,
-                    **worker_in.labels,
+                    **(existing.labels or {}),
+                    **(worker_in.labels or {}),
                 },
                 "cluster_id": existing.cluster_id,
-                "state": WorkerStateEnum.READY,
+                "state": target_state,
             }
         )
     else:
@@ -156,6 +169,8 @@ def update_worker_data(
         )
         if cluster is not None:
             to_create_worker.cluster = cluster
+    to_create_worker.heartbeat_time = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+    to_create_worker.unreachable = False
     to_create_worker.compute_state()
     return to_create_worker
 
@@ -211,12 +226,19 @@ def get_existing_worker(
     # find existing worker by external_id or worker_uuid
     for field in ["external_id", "worker_uuid"]:
         value = getattr(worker_in, field, None)
-        if value is None:
+        if value is None or value == "":
             continue
         fields = {**static_fields, field: value}
         existing_worker = next(iter(filter_workers_by_fields(workers, fields)), None)
         if existing_worker is not None:
             return existing_worker
+
+    # 云池预建行由同名云主机认领，保留外部实例、密钥和池的关联。
+    for worker in workers:
+        if worker.worker_pool_id is not None and worker.external_id is not None and _matches_exact_fields(
+            worker, {**static_fields, "name": worker_in.name}
+        ):
+            return worker
 
     # find existing worker by name
     if worker_in.labels and worker_in.labels.get("gpustack.existence-check"):
@@ -301,7 +323,7 @@ async def create_worker(request: Request, worker_in: WorkerCreate):
             if cluster is None or cluster.deleted_at is not None:
                 raise NotFoundException(message="Cluster not found")
             cluster_id = cluster.id
-            all_workers = await Worker.all_by_fields(session, {"deleted_at": None})
+            all_workers = await Worker.all(session)
             existing_worker = get_existing_worker(cluster_id, worker_in, all_workers)
             check_worker_name_conflict(
                 worker_in.name,
@@ -331,7 +353,7 @@ async def create_worker(request: Request, worker_in: WorkerCreate):
 
             try:
                 if existing_worker is not None:
-                    await existing_worker.update(session, new_worker.model_dump(exclude={"id"}))
+                    await WorkerService(session).update(existing_worker, new_worker.model_dump(exclude={"id"}))
                     worker = existing_worker
                 else:
                     worker = await Worker.create(session, new_worker)

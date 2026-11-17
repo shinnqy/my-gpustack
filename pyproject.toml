@@ -34,6 +34,8 @@ dependencies = [
     "openai>=1.31.1",
     "python-multipart>=0.0.17",
     "jinja2>=3.1.4,<4",
+    "pydo>=0.15,<1",
+    "cryptography>=43",
 ]
 
 [dependency-groups]

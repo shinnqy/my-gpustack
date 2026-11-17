@@ -24,8 +24,12 @@ class WorkerService:
     async def update(
         self, worker: Worker, source: Union[dict, SQLModel, None] = None, **kwargs
     ):
+        old_name = worker.name
         result = await worker.update(self.session, source, **kwargs)
         await delete_cache_by_key(self.get_by_id, worker.id)
+        await delete_cache_by_key(self.get_by_name, old_name)
+        if worker.name != old_name:
+            await delete_cache_by_key(self.get_by_name, worker.name)
         return result
 
     async def batch_update(
@@ -40,6 +44,7 @@ class WorkerService:
         updated = await Worker.batch_update(self.session, workers)
         for worker in workers:
             await delete_cache_by_key(self.get_by_id, worker.id)
+            await delete_cache_by_key(self.get_by_name, worker.name)
 
         return updated
 
@@ -50,6 +55,36 @@ class WorkerService:
             return None
         self.session.expunge(result)
         return result
+
+    @locked_cached()
+    async def get_by_name(self, name: str) -> Optional[Worker]:
+        result = await Worker.one_by_field(self.session, "name", name)
+        if result is None:
+            return None
+        self.session.expunge(result)
+        return result
+
+    async def delete(self, worker: Worker, **kwargs):
+        worker_id = worker.id
+        worker_name = worker.name
+        result = await worker.delete(self.session, **kwargs)
+        # Worker cache is high-frequency, non-security-critical, skip coordinator sync
+        await delete_cache_by_key(self.get_by_id, worker_id, sync_coordinator=False)
+        await delete_cache_by_key(self.get_by_name, worker_name, sync_coordinator=False)
+        return result
+
+    async def request_delete(self, worker: Worker, auto_commit: bool = True):
+        """托管资源先软删除，保留外部 ID，交给开机控制器完成清理。"""
+        from gpustack.schemas.workers import WorkerStateEnum
+        managed = worker.worker_pool_id is not None and (worker.external_id is not None or worker.ssh_key_id is not None)
+        if managed:
+            worker.state = WorkerStateEnum.DELETING
+            if worker.deleted_at is None:
+                await self.delete(worker, soft=True, auto_commit=auto_commit)
+            else:
+                await self.update(worker, auto_commit=auto_commit)
+        else:
+            await self.delete(worker, auto_commit=auto_commit)
 
 
 class ModelService:

@@ -49,6 +49,18 @@ from gpustack.server.worker_request import stream_to_worker
 import aiohttp
 import logging
 import random
+from gpustack.schemas.clusters import (
+    ClusterUpdate,
+    ClusterCreate,
+    ClusterPublic,
+    ClustersPublic,
+    Cluster,
+    ClusterStateEnum,
+    ClusterProvider,
+    SensitiveRegistrationConfig,
+    ClusterRegistrationTokenPublic,
+)
+from gpustack.schemas.clusters import CloudOptions, WorkerPool, WorkerPoolCreate, WorkerPoolPublic, CloudCredential
 
 
 router = APIRouter()
@@ -171,6 +183,16 @@ async def create_cluster(session: SessionDep, input: ClusterCreate):
 
     if input.provider == ClusterProvider.Kubernetes:
         enforce_data_dir_mounts(input)
+    if input.provider not in {ClusterProvider.Kubernetes, ClusterProvider.Docker}:
+        await _check_cloud_credential(session, input.provider, input.credential_id)
+        if not (input.server_url or get_global_config().server_external_url):
+            raise InvalidException(message="server_url is required for a cloud cluster")
+        if input.provider == ClusterProvider.DigitalOcean and not input.region:
+            raise InvalidException(message="region is required for DigitalOcean")
+        for pool_input in input.worker_pools or []:
+            _check_pool_options(input.provider, pool_input)
+    elif input.worker_pools:
+        raise InvalidException(message="Worker pools are only supported for cloud clusters")
     hoist_system_default_container_registry(input)
 
     target_state = ClusterStateEnum.READY
@@ -188,7 +210,11 @@ async def create_cluster(session: SessionDep, input: ClusterCreate):
         }
     )
     try:
-        cluster = await Cluster.create(session, to_create_cluster)
+        cluster = await Cluster.create(session, to_create_cluster, auto_commit=False)
+        for pool_input in input.worker_pools or []:
+            pool = WorkerPool.model_validate({**pool_input.model_dump(), "cluster_id": cluster.id})
+            await WorkerPool.create(session, pool, auto_commit=False)
+        await session.commit()
         return cluster
     except Exception as e:
         raise InternalServerErrorException(message=f"Failed to create cluster: {e}")
@@ -212,6 +238,28 @@ async def update_cluster(session: SessionDep, id: int, input: ClusterUpdate):
     return await Cluster.one_by_id(session, id)
 
 
+async def _check_cloud_credential(session, provider, credential_id):
+    credential = await CloudCredential.one_by_id(session, credential_id) if credential_id is not None else None
+    if credential is None or credential.deleted_at is not None:
+        raise InvalidException(message="A valid cloud credential is required")
+    if credential.provider != provider:
+        raise InvalidException(message="Cloud credential provider must match the cluster provider")
+
+
+def _check_pool_options(provider, pool):
+    if not pool.instance_type or not pool.os_image or not pool.image_name:
+        raise InvalidException(message="instance_type, os_image and image_name are required")
+    volumes = (pool.cloud_options.volumes or []) if pool.cloud_options else []
+    if provider == ClusterProvider.Shuihua:
+        if not pool.instance_type.isdigit() or int(pool.instance_type) <= 0:
+            raise InvalidException(message="Shuihua instance_type must be a positive template ID")
+        if volumes:
+            raise InvalidException(message="Shuihua does not support cloud volumes")
+    for volume in volumes:
+        if not volume.size_gb or volume.size_gb <= 0 or volume.format not in {"ext4", "xfs"}:
+            raise InvalidException(message="Cloud volumes require a positive size_gb and ext4 or xfs format")
+
+
 @router.delete("/{id}")
 async def delete_cluster(session: SessionDep, id: int):
     existing = await Cluster.one_by_id(session, id)
@@ -222,10 +270,38 @@ async def delete_cluster(session: SessionDep, id: int):
         raise ConflictException(
             message=f"cluster {existing.name}(id: {id}) has models, cannot be deleted"
         )
+    if await WorkerPool.all_by_field(session, "cluster_id", id):
+        raise ConflictException(message="Delete the cluster's worker pools before deleting the cluster")
     try:
         await existing.delete(session=session)
     except Exception as e:
         raise InternalServerErrorException(message=f"Failed to delete cluster: {e}")
+
+
+@router.post("/{id}/worker-pools", response_model=WorkerPoolPublic)
+async def create_worker_pool(session: SessionDep, id: int, input: WorkerPoolCreate):
+    cluster = await Cluster.one_by_id(session, id)
+    if not cluster or cluster.deleted_at is not None:
+        raise NotFoundException(message=f"cluster {id} not found")
+    if cluster.provider in [ClusterProvider.Docker, ClusterProvider.Kubernetes]:
+        raise InvalidException(
+            message=f"Cannot create worker pool for cluster {cluster.name}(id: {id}) with provider {cluster.provider}"
+        )
+    _check_pool_options(cluster.provider, input)
+    await _check_cloud_credential(session, cluster.provider, cluster.credential_id)
+    try:
+        cloud_options = input.cloud_options or CloudOptions()
+        worker_pool = WorkerPool.model_validate(
+            {
+                **input.model_dump(),
+                "cluster_id": id,
+                "cloud_options": cloud_options,
+            }
+        )
+        worker_pool.cluster = cluster
+        return await WorkerPool.create(session, worker_pool)
+    except Exception as e:
+        raise InternalServerErrorException(message=f"Failed to create worker pool: {e}")
 
 
 def get_registration_from_cluster(

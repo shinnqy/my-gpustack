@@ -36,6 +36,23 @@ from typing import TYPE_CHECKING
 from pydantic import Field as PydanticField
 import re
 from typing import Any
+from sqlmodel import ForeignKey
+from sqlmodel import Integer
+from sqlmodel import JSON
+import sqlalchemy as sa
+
+
+class WorkerPoolUpdate(SQLModel):
+    name: str
+    batch_size: Optional[int] = Field(default=None, ge=1)
+    replicas: int = Field(default=1, ge=0)
+    labels: Optional[Dict[str, str]] = Field(sa_column=Column(JSON), default={})
+
+
+class Volume(BaseModel):
+    format: Optional[str] = None
+    size_gb: Optional[int] = None
+    name: Optional[str] = None
 
 
 class ImageCredential(BaseModel):
@@ -345,11 +362,116 @@ def is_gpu_service_cluster(cluster: "Cluster") -> bool:
     return is_gpu_service_k8s_options(cluster.k8s_options)
 
 
+class CloudOptions(BaseModel):
+    volumes: Optional[List[Volume]] = None
+
+
+class WorkerPoolCreate(WorkerPoolUpdate):
+    instance_type: str
+    os_image: str
+    image_name: str
+    # ``default_factory``, not ``default={}``: a default is not validated, so
+    # an omitted ``cloud_options`` stayed a raw dict on the model and every
+    # ``model_dump`` of it -- the create routes dump the input to build the row
+    # -- warned ``PydanticSerializationUnexpectedValue``.
+    cloud_options: Optional[CloudOptions] = Field(
+        default_factory=CloudOptions,
+        sa_column=Column(pydantic_column_type(CloudOptions)),
+    )
+    zone: Optional[str] = None
+    # instance_spec is for UI to store the instance_type's extended specifications for display.
+    instance_spec: Optional[Dict[str, Any]] = Field(
+        default=None, sa_column=Column(JSON)
+    )
+
+
+class WorkerPoolBase(WorkerPoolCreate):
+    cluster_id: int = Field(
+        sa_column=Column(Integer, ForeignKey("clusters.id", ondelete="CASCADE"))
+    )
+
+
+class WorkerPool(WorkerPoolBase, BaseModelMixin, table=True):
+    __tablename__ = "worker_pools"
+    id: Optional[int] = Field(default=None, primary_key=True)
+    cluster: Optional["Cluster"] = Relationship(
+        back_populates="cluster_worker_pools",
+        sa_relationship_kwargs={"lazy": "noload"},
+    )
+    pool_workers: list["Worker"] = Relationship(
+        sa_relationship_kwargs={"lazy": "noload"},
+        back_populates="worker_pool",
+    )
+
+    @computed_field
+    @property
+    def workers(self) -> int:
+        return len([worker for worker in self.pool_workers or [] if worker.deleted_at is None and worker.state.value != "deleting"])
+
+    @computed_field
+    @property
+    def ready_workers(self) -> int:
+        return len([worker for worker in self.pool_workers or [] if worker.deleted_at is None and worker.state.value == "ready"])
+
+
+class WorkerPoolPublic(WorkerPoolBase, PublicFields):
+    workers: int = Field(default=0)
+    ready_workers: int = Field(default=0)
+
+
+WorkerPoolsPublic = PaginatedList[WorkerPoolPublic]
+
+
 class ClusterProvider(Enum):
     Docker = "Docker"
     Kubernetes = "Kubernetes"
     DigitalOcean = "DigitalOcean"
     Shuihua = "Shuihua"
+
+
+class CloudCredentialBase(SQLModel):
+    """
+    Supports providers other than Kubernetes and Docker.
+    """
+
+    name: str
+    description: Optional[str] = None
+    provider: ClusterProvider = Field(default=ClusterProvider.DigitalOcean)
+    key: Optional[str] = None
+    options: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSON))
+
+
+class CloudCredentialUpdate(CloudCredentialBase):
+    secret: Optional[str] = None
+
+
+class CloudCredentialCreate(CloudCredentialUpdate):
+    pass
+
+
+class CloudCredential(CloudCredentialCreate, BaseModelMixin, table=True):
+    __tablename__ = "cloud_credentials"
+    __table_args__ = (
+        sa.Index(
+            "idx_cloud_credentials_deleted_at_created_at", "deleted_at", "created_at"
+        ),
+    )
+    id: Optional[int] = Field(default=None, primary_key=True)
+
+    def __hash__(self):
+        return hash(self.id)
+
+    def __eq__(self, other):
+        if super().__eq__(other) and isinstance(other, CloudCredential):
+            return self.id == other.id
+        return False
+
+
+class CloudCredentialPublic(CloudCredentialBase, PublicFields):
+    pass
+
+
+CloudCredentialsPublic = PaginatedList[CloudCredentialPublic]
 
 
 class ClusterStateEnum(str, Enum):
@@ -418,9 +540,13 @@ class ClusterCreateBase(ClusterUpdate):
     provider: ClusterProvider = Field(default=ClusterProvider.Docker)
     region: Optional[str] = None
 
+    credential_id: Optional[int] = Field(
+        default=None, foreign_key="cloud_credentials.id"
+    )
+
 
 class ClusterCreate(ClusterCreateBase):
-    pass
+    worker_pools: Optional[List[WorkerPoolCreate]] = None
 
 
 class ClusterBase(ClusterCreateBase):
@@ -501,6 +627,15 @@ class Cluster(ClusterBase, BaseModelMixin, table=True):
             return self.id == other.id
         return False
 
+    cluster_worker_pools: List[WorkerPool] = Relationship(
+        sa_relationship_kwargs={"cascade": "delete", "lazy": "noload"},
+        back_populates="cluster",
+    )
+
+    cluster_models: List["Model"] = Relationship(
+        sa_relationship_kwargs={"lazy": "noload"}, back_populates="cluster"
+    )
+
 
 class ClusterPublic(ClusterBase, PublicFields):
     workers: int = Field(default=0)
@@ -528,3 +663,41 @@ class ClusterRegistrationTokenPublic(BaseModel):
     image: str
     env: Dict[str, str]
     args: List[str]
+
+
+class CredentialType(str, Enum):
+    SSH = "ssh"
+    CA = "ca"
+    X509 = "x509"
+
+
+class SSHKeyOptions(BaseModel):
+    algorithm: str = Field(default="RSA")
+    length: int = Field(default=2048)
+
+
+class CredentialBase(SQLModel):
+    external_id: Optional[str] = Field(
+        default=None, sa_column=Column(String(255), nullable=True)
+    )
+
+    credential_type: CredentialType = Field(default=CredentialType.SSH)
+
+    public_key: str = Field(sa_column=Column(Text, nullable=False))
+
+    encoded_private_key: str = Field(default="", sa_column=Column(Text, nullable=False))
+
+    ssh_key_options: Optional[SSHKeyOptions] = Field(
+        default=None,
+        sa_column=Column(pydantic_column_type(SSHKeyOptions), nullable=True),
+    )
+
+
+class Credential(CredentialBase, BaseModelMixin, table=True):
+    __tablename__ = "credentials"
+    __table_args__ = (sa.Index("idx_credentials_external_id", "external_id"),)
+    id: Optional[int] = Field(default=None, primary_key=True)
+
+
+if TYPE_CHECKING:
+    from gpustack.schemas.models import Model

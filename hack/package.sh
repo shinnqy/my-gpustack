@@ -30,7 +30,10 @@ command -v docker >/dev/null || { printf 'Docker is required for make package.\n
 docker buildx version >/dev/null
 
 TAG="${PACKAGE_NAMESPACE}/${PACKAGE_REPOSITORY}:${PACKAGE_TAG}"
-REVISION="$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || printf unknown)"
+REVISION=${PACKAGE_REVISION:-}
+if [[ -z "$REVISION" ]]; then
+    REVISION="$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || printf unknown)"
+fi
 LABELS=(
     "org.opencontainers.image.title=my-gpustack"
     "org.opencontainers.image.version=${PACKAGE_TAG}"

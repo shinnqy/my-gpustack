@@ -68,6 +68,11 @@ def start_cmd_options(parser_server: argparse.ArgumentParser):
     )
     server_group = parser_server.add_argument_group("Server settings")
     server_group.add_argument(
+        "--shuihua-api-base-url", type=str,
+        help="Base URL of the Shuihua cloud API.",
+        default=get_gpustack_env("SHUIHUA_API_BASE_URL"),
+    )
+    server_group.add_argument(
         "--database-url",
         type=str,
         help="URL of the database. Example: postgresql://user:password@hostname:port/db_name.",
@@ -199,6 +204,7 @@ def set_common_options(args, config_data: dict):
 def set_server_options(args, config_data: dict):
     options = [
         "database_url",
+        "shuihua_api_base_url",
         "enable_worker",
     ]
 

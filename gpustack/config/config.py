@@ -237,6 +237,8 @@ class Config(WorkerConfig, BaseSettings):
     """服务端默认命名空间"""
     namespace: str = "gpustack-system"
 
+    shuihua_api_base_url: Optional[str] = None
+
 
 def get_image_name(
     image_name_override: Optional[str],

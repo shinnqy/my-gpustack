@@ -21,6 +21,11 @@ from gpustack.schemas.links import (
     ModelInstanceDraftModelFileLink,
 )
 from gpustack.schemas.model_files import ModelFile
+from gpustack.schemas.clusters import (
+    CloudCredential,
+    WorkerPool,
+    Credential,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -57,6 +62,13 @@ async def init_db_engine(db_url: str):
 
 async def create_db_and_tables(engine: AsyncEngine):
     async with engine.begin() as conn:
+        # 先建依赖表，再为已有表补外键字段；create_all 本身不会升级已有列。
+        await conn.run_sync(
+            SQLModel.metadata.create_all,
+            tables=[CloudCredential.__table__, Credential.__table__, Cluster.__table__,
+                    WorkerPool.__table__, Worker.__table__, Model.__table__, ModelInstance.__table__,
+                    ModelFile.__table__, ModelInstanceModelFileLink.__table__, ModelInstanceDraftModelFileLink.__table__],
+        )
         await conn.run_sync(_upgrade_model_instance_columns)
         await conn.run_sync(_upgrade_worker_columns)
         await conn.run_sync(_upgrade_cluster_columns)
@@ -85,6 +97,26 @@ def _upgrade_cluster_columns(connection):
         declaration = str(CreateColumn(table.c.k8s_options).compile(dialect=connection.dialect))
         table_name = connection.dialect.identifier_preparer.quote(table.name)
         connection.exec_driver_sql(f"ALTER TABLE {table_name} ADD COLUMN {declaration}")
+    _add_missing_columns(connection, Cluster.__table__, {"credential_id"})
+
+
+def _add_missing_columns(connection, table, names):
+    inspector = inspect(connection)
+    if not inspector.has_table(table.name):
+        return
+    existing = {column["name"] for column in inspector.get_columns(table.name)}
+    quote = connection.dialect.identifier_preparer.quote
+    for column in table.columns:
+        if column.name not in names or column.name in existing:
+            continue
+        if connection.dialect.name == "postgresql" and isinstance(column.type, SQLAlchemyEnum):
+            column.type.create(connection, checkfirst=True)
+        declaration = str(CreateColumn(column).compile(dialect=connection.dialect))
+        for fk in column.foreign_keys:
+            declaration += f" REFERENCES {quote(fk.column.table.name)} ({quote(fk.column.name)})"
+            if fk.ondelete:
+                declaration += f" ON DELETE {fk.ondelete}"
+        connection.exec_driver_sql(f"ALTER TABLE {quote(table.name)} ADD COLUMN {declaration}")
 
 
 def _upgrade_model_instance_columns(connection):
@@ -106,6 +138,12 @@ def _upgrade_model_instance_columns(connection):
 
 
 def _upgrade_worker_columns(connection):
+    _add_missing_columns(connection, Worker.__table__, {"provider", "worker_pool_id", "external_id", "ssh_key_id", "provider_config"})
+    columns = {column["name"] for column in inspect(connection).get_columns(Worker.__table__.name)}
+    if "cluster_id" in columns and inspect(connection).has_table("clusters"):
+        cluster_columns = {column["name"] for column in inspect(connection).get_columns("clusters")}
+        if "provider" in cluster_columns:
+            connection.exec_driver_sql("UPDATE workers SET provider = (SELECT provider FROM clusters WHERE clusters.id = workers.cluster_id) WHERE provider IS NULL")
     inspector = inspect(connection)
     table = Worker.__table__
     if not inspector.has_table(table.name):

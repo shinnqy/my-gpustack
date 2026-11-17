@@ -128,18 +128,25 @@ def test_package_buildx_contract(tmp_path, push, export, network):
         "    stream.write(json.dumps(sys.argv[1:]) + '\\n')\n"
     )
     executable.chmod(0o755)
+    forbidden_git = tmp_path / "git"
+    git_marker = tmp_path / "git-was-invoked"
+    forbidden_git.write_text(
+        f"#!{sys.executable}\nfrom pathlib import Path\nPath({str(git_marker)!r}).touch()\nraise SystemExit(99)\n"
+    )
+    forbidden_git.chmod(0o755)
     result = subprocess.run(
         ["bash", str(ROOT / "hack/package.sh")], capture_output=True, text=True,
         env={**os.environ, "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
              "PACKAGE_TEST_LOG": str(log), "PACKAGE_ARCH": "aarch64",
              "PACKAGE_NAMESPACE": "local", "PACKAGE_REPOSITORY": "my-gpustack",
-             "PACKAGE_TAG": "chapter15", "PACKAGE_PUSH": push, "PACKAGE_PULL": "false",
+             "PACKAGE_TAG": "chapter15", "PACKAGE_PUSH": push, "PACKAGE_PULL": "false", "PACKAGE_REVISION": "fixture-revision",
              "PACKAGE_NETWORK": network,
              "GPUSTACK_OPERATOR_VERSION": "v0.9.2", "GPUSTACK_BASE_IMAGE": "base",
              "APT_MIRROR": "https://apt.example", "PIP_INDEX_URL": "https://pypi.example/simple",
              "GPUSTACK_TOOLS_DOWNLOAD_BASE_URL": "https://tools.example"},
     )
     assert result.returncode == 0, result.stderr
+    assert not git_marker.exists()
     command = [json.loads(line) for line in log.read_text().splitlines()][-1]
     assert command[:2] == ["buildx", "build"]
     assert command[command.index("--platform") + 1] == "linux/arm64"
@@ -157,6 +164,7 @@ def test_package_buildx_contract(tmp_path, push, export, network):
     assert "GPUSTACK_TOOLS_DOWNLOAD_BASE_URL=https://tools.example" in command
     assert "APT_MIRROR=https://apt.example" in command
     assert "PIP_INDEX_URL=https://pypi.example/simple" in command
+    assert "org.opencontainers.image.revision=fixture-revision" in command
     assert command[-1] == str(ROOT)
 
 

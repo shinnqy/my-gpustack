@@ -28,6 +28,9 @@ from sqlmodel import Integer
 from sqlmodel import Relationship
 from .clusters import Cluster
 from gpustack.schemas.config import ModelInstanceProxyModeEnum
+from .clusters import WorkerPool
+from .clusters import ClusterProvider
+from typing import Any
 
 
 class UtilizationInfo(BaseModel):
@@ -238,8 +241,13 @@ class WorkerCreate(WorkerStatusStored, WorkerUpdate):
         default=None, sa_column=Column(String(100), nullable=True)
     )
 
+    external_id: Optional[str] = Field(
+        default=None, sa_column=Column(String(255), nullable=True)
+    )
+
 
 class WorkerBase(WorkerCreate):
+    provider: Optional[ClusterProvider] = Field(default=None)
     state: WorkerStateEnum = WorkerStateEnum.NOT_READY
 
     heartbeat_time: Optional[datetime] = Field(
@@ -305,6 +313,19 @@ class WorkerBase(WorkerCreate):
             return None
         return self.proxy_address
 
+    worker_pool_id: Optional[int] = Field(
+        default=None,
+        sa_column=Column(Integer, ForeignKey("worker_pools.id"), nullable=True),
+    )  # The worker pool this worker belongs to
+
+    ssh_key_id: Optional[int] = Field(
+        default=None, sa_column=Column(Integer, nullable=True)
+    )
+
+    provider_config: Optional[Dict[str, Any]] = Field(
+        default=None, sa_column=Column(JSON, nullable=True)
+    )
+
 
 class Worker(WorkerBase, BaseModelMixin, table=True):
     __tablename__ = 'workers'
@@ -324,6 +345,10 @@ class Worker(WorkerBase, BaseModelMixin, table=True):
         if super().__eq__(other) and isinstance(other, Worker):
             return self.id == other.id
         return False
+
+    worker_pool: Optional[WorkerPool] = Relationship(
+        back_populates="pool_workers", sa_relationship_kwargs={"lazy": "noload"}
+    )
 
 
 class WorkerPublic(

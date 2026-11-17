@@ -196,6 +196,11 @@ class Model(ModelBase, BaseModelMixin, table=True):
         back_populates="model",
     )
 
+    cluster: "Cluster" = Relationship(
+        back_populates="cluster_models",
+        sa_relationship_kwargs={"lazy": "noload"},
+    )
+
 
 class ModelCreate(ModelBase):
     pass
@@ -617,3 +622,7 @@ def get_mmproj_filename(model: Union[Model, ModelSource]) -> Optional[str]:
 
 if TYPE_CHECKING:
     from gpustack.schemas.model_files import ModelFile
+
+
+if TYPE_CHECKING:
+    from gpustack.schemas.clusters import Cluster

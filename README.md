@@ -1,6 +1,6 @@
-# My GPUStack：第十五章完成版
+# My GPUStack：第十六章完成版
 
-按 `guide/v1/01`～`15` 的正文及配套辅助代码整理。
+按 `guide/v1/01`～`16` 的正文及配套辅助代码整理。
 已具备集群、模型与实例记录、事件控制器，以及 Worker 注册、设备采集、心跳和状态批量上报。
 已接通模型和实例的 Watch 流、Worker 客户端缓存、ServeManager 订阅骨架，以及 Server 快照缓存和写入后的缓存失效。
 已接通调度器、去重队列、集群/GPU 所在 Worker/标签/就绪状态过滤，以及调度结果回写。
@@ -18,6 +18,8 @@ Spread/Binpack 放置评分，以及缩容评分链。
 以及 vLLM 的 Ray 和 MP 多机工作负载计划。
 已接通 Kubernetes 集群选项和部署清单、经 Worker 的 Kubernetes API 代理，
 以及 Server 侧 operator worker gateway 子进程、TLS Unix socket 客户端和集群订阅协调。
+已接通云账号、Worker Pool、SSH 密钥记录、DigitalOcean/Shuihua provider、cloud-init，
+以及分批开机、同名注册认领、扩缩容、失败后的资源清理和重启接续。
 
 ## 安装与启动
 
@@ -710,6 +712,76 @@ Server 退出时停止网关并清理私有 socket 目录。
 启动会给已有 `clusters` 表补上可空的 `k8s_options`，保留原集群、注册令牌和已有模型。
 安装包已包含四个 jinja 模板，安装后也能生成清单。
 
+## 第十六章检查点
+
+先按“安装与启动”或“统一镜像启动 Server”启动 Server，设置云主机可访问的 `server_url`。
+使用已有驱动及容器工具的系统镜像，或选择本章 cloud-init 支持的 Debian/Ubuntu + NVIDIA 初始化路径。
+下面命令会申请真实云资源；本项目的自动化验证使用模拟 API，不消耗真实云额度。
+
+创建 DigitalOcean 云账号，记录响应的 `id`：
+
+```bash
+curl -s -X POST http://127.0.0.1:30080/v2/cloud-credentials \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"do","provider":"DigitalOcean","secret":"DO_API_TOKEN"}'
+```
+
+用实际账号可用的地域、机型和系统镜像替换占位值，Worker 使用包含本项目的统一镜像：
+
+```bash
+curl -s -X POST http://127.0.0.1:30080/v2/clusters \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"do-gpu","provider":"DigitalOcean","credential_id":CREDENTIAL_ID,"region":"REGION","server_url":"http://SERVER_IP:30080","worker_pools":[{"name":"gpu","instance_type":"INSTANCE_TYPE","os_image":"OS_IMAGE","image_name":"REGISTRY/my-gpustack:chapter16","replicas":2,"batch_size":1}]}'
+```
+
+也可先建空云集群，再通过 `POST /v2/clusters/CLUSTER_ID/worker-pools` 创建池。
+云账号必须与集群的 provider 一致，Docker/Kubernetes 集群不能创建云 Worker Pool。
+`GET /v2/cloud-credentials` 不回显 `secret`；在用的云账号和仍有 Worker 的池会阻止删除。
+
+查询期望和实际状态：
+
+```bash
+curl -s http://127.0.0.1:30080/v2/worker-pools | python -m json.tool
+curl -s http://127.0.0.1:30080/v2/workers | python -m json.tool
+```
+
+池的 `workers`、`ready_workers` 分别显示当前数量和就绪数量。
+`batch_size` 限制 `pending + provisioning` 数量，进入 `initializing` 后释放开机名额。
+每台 Worker 依次记录 SSH 密钥、云实例 `external_id`、公网地址、磁盘 ID 和初始化状态；
+每一步提交后由下一次事件继续，Server 重启时从数据库接续。
+
+cloud-init 写入权限为 `0600` 的注册配置和 Worker 启动脚本，使用镜像的统一入口启动 Worker。
+云主机按预建名称认领原 Worker 行，保留池、实例和密钥关联；若提前注册，会等待云资源准备完成后再标为 `ready`。
+设备采集默认上报探测到的全部 GPU，原有单卡实验过滤写法保留为注释。
+自动生成的 SSH 私钥保存在 `Credential.encoded_private_key` 中，使用 Base64 编码。
+
+调整池大小（使用池的实际名称和 ID）：
+
+```bash
+curl -s -X PUT http://127.0.0.1:30080/v2/worker-pools/POOL_ID \
+  -H 'Content-Type: application/json' -d '{"name":"gpu","replicas":3,"batch_size":1}'
+```
+
+提高 `replicas` 会补齐机器；降低时优先清理未承载实例、待开机或出错的 Worker。
+删除单台 Worker 会先标为 `deleting`，云资源清理完成后删除记录；池仍有缺口时自动补齐。
+删除失败会保留外部实例和密钥标识，Worker 显示 `error`，再次 DELETE 可重试清理。
+有 SSH 密钥但尚无云实例的失败 Worker 也会清理密钥。
+
+完整删除一个池及其云资源时，先把 `replicas` 调为 0，等 Worker 行和云资源清理完成后，
+依次删除 Worker Pool、集群和云账号。
+开机前的 healthz 检查从 Server 发起，仅验证 Server 侧能访问该地址；云主机回连能力仍由网络配置决定。
+失败 Worker 不会自动重复创建云实例；初始化阶段等待 cloud-init 启动的 Worker 注册。
+创建幂等键由已保存的 Worker 身份和步骤时间派生，用于同一步骤尚未写回时的重放；是否复用实例取决于 provider，DigitalOcean 的创建接口无此保证。
+
+DigitalOcean 的 `cloud_options.volumes` 支持正数 `size_gb` 和 `ext4`/`xfs` 格式。
+数据盘通过云 API 创建并 attach，文件系统挂载与缓存目录需要由系统镜像配置。
+Shuihua 使用同一池接口：Server 设置 `--shuihua-api-base-url` 或 `GPUSTACK_SHUIHUA_API_BASE_URL`，
+云账号 provider 为 `Shuihua`，`secret` 为 API key，`instance_type` 为数字 template ID，`os_image` 为镜像 UUID。
+该适配器将公钥写入 cloud-init，并保留共享 SSH 地址/端口提示；它不支持独立数据盘。
+
+首次启动会创建 `cloud_credentials`、`worker_pools`、`credentials` 表，并为旧集群和 Worker 表补齐可空字段，保留已有数据。
+源码构建继续使用前文统一镜像；设置 `PACKAGE_REVISION=chapter16` 可显式提供构建版本标识，打包脚本便不读取 Git。
+
 ## 本地验证
 
 ```bash
@@ -751,4 +823,9 @@ ServiceAccount 令牌轮换、watch 断连、异常断流和数据库会话释�
 Runtime 转 Pod 检查使用模拟节点/API，验证实际 SDK 的设备资源转换、共享内存数量和挂载继承。
 第十五章独立 Server/Worker/operator 替身进程验证注册、清单、HTTPS 集群代理、订阅状态切换和 SIGTERM 清理；
 未对真实 Kubernetes 集群执行 kubectl apply，也未部署真实 operator 或推理 Pod。
+云池测试覆盖 REST 与关联校验、批次上限、分步持久化、提前注册、扩缩容、清理失败重试、仅密钥资源清理、
+幂等键重放、旧库升级、cloud-init 转义，以及两个 provider 的协议和 HTTP 客户端释放。
+独立 Server 与模拟云 API 进程检查会从生成的 cloud-init 配置启动 Worker 替身，验证 Server 重启接续、
+扩容、删除补齐、缩容到零，以及 healthz 失败时不创建云资源。
+这些检查不会创建真实云主机、安装驱动或执行真实 cloud-init；实际云账号和硬件需另行验收。
 生产启动仍使用 PostgreSQL；真实 GPU/NPU 驱动采集需要在对应机器上验证。

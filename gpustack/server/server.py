@@ -38,6 +38,7 @@ import subprocess
 import threading
 import aiohttp
 import signal
+from gpustack.server.controllers import WorkerPoolController
 
 
 logger = logging.getLogger(__name__)
@@ -270,6 +271,8 @@ class Server:
         tasks.append(asyncio.create_task(model_file_controller.start()))
         cluster_controller = ClusterController(self._config)
         tasks.append(asyncio.create_task(cluster_controller.start()))
+        worker_pool_controller = WorkerPoolController()
+        tasks.append(asyncio.create_task(worker_pool_controller.start()))
         logger.debug("Controllers started.")
         return tasks
 

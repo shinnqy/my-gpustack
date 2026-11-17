@@ -7,6 +7,7 @@ from gpustack.routes import clusters, model_instances, models, probes, workers
 from gpustack.routes import clusters, model_files, model_instances, models, probes, workers
 from gpustack.api.exceptions import openai_api_error_responses
 from gpustack.routes import openai
+from gpustack.routes import cloud_credentials, worker_pools
 
 
 versioned_prefix = "/v2"
@@ -51,6 +52,8 @@ v1_base_router.add_api_route(
 )
 
 
+v1_base_router.include_router(cloud_credentials.router, prefix="/cloud-credentials", tags=["Cloud Credentials"])
+v1_base_router.include_router(worker_pools.router, prefix="/worker-pools", tags=["Worker Pools"])
 api_router.include_router(v1_base_router, prefix=versioned_prefix)
 
 
