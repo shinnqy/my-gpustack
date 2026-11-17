@@ -65,7 +65,7 @@ class WorkerStatusCollector:
                 # FIXME: 第九章实验：只向 GPUStack 上报 0、1 两张卡；FIXME: 第十四章实验，每台机器只上报 1 张卡
                 status.gpu_devices = [
                     gpu for gpu in gpu_devices
-                    if gpu.index in {0}
+                    if gpu.index in {3}
                 ]
             except GPUDetectExepction as e:
                 state_message = str(e)
