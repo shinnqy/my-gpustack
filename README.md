@@ -500,6 +500,8 @@ ctr -n k8s.io images export --platform linux/arm64 - \
 PACKAGE_ARCH=arm64 \
 PACKAGE_PULL=false \
 PACKAGE_NETWORK=host \
+APT_MIRROR=https://mirrors.aliyun.com \
+PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
 GPUSTACK_OPERATOR_VERSION=v0.9.2 \
 GPUSTACK_TOOLS_DOWNLOAD_BASE_URL=https://gpustack-1303613262.cos.ap-guangzhou.myqcloud.com \
 make package
@@ -509,6 +511,9 @@ make package
 `PACKAGE_NETWORK=host` 为构建中的 `RUN` 使用宿主机网络，并声明 `network.host` entitlement，
 对应原项目的 host 构建网络方式。宿主机联网正常、构建容器 DNS 失败时可使用此选项。
 其默认值为 `default`，也支持 `none`；它不修改 Docker daemon、iptables 或部署后 Pod 的网络。
+`APT_MIRROR` 是 Debian 镜像站的基础地址，同时用于主仓库和安全更新仓库；默认使用官方源。
+`PIP_INDEX_URL` 同时用于安装 uv 的 pip，以及随后构建 wheel、安装项目依赖的 uv，默认使用 PyPI。
+软件源只用于构建。系统包安装与 uv 安装拆成独立层，后者下载失败后不必重复安装系统包。
 默认 `base` 使用 Python 3.11，`PYTHON_VERSION` 可覆盖其版本；
 `GPUSTACK_BASE_IMAGE` 保留原项目的基础镜像覆盖能力，自定义基础镜像需具备对应
 Python、uv、make、tini 和运行依赖。

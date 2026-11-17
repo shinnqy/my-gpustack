@@ -136,6 +136,7 @@ def test_package_buildx_contract(tmp_path, push, export, network):
              "PACKAGE_TAG": "chapter15", "PACKAGE_PUSH": push, "PACKAGE_PULL": "false",
              "PACKAGE_NETWORK": network,
              "GPUSTACK_OPERATOR_VERSION": "v0.9.2", "GPUSTACK_BASE_IMAGE": "base",
+             "APT_MIRROR": "https://apt.example", "PIP_INDEX_URL": "https://pypi.example/simple",
              "GPUSTACK_TOOLS_DOWNLOAD_BASE_URL": "https://tools.example"},
     )
     assert result.returncode == 0, result.stderr
@@ -154,6 +155,8 @@ def test_package_buildx_contract(tmp_path, push, export, network):
         assert "--allow" not in command
     assert "GPUSTACK_OPERATOR_VERSION=v0.9.2" in command
     assert "GPUSTACK_TOOLS_DOWNLOAD_BASE_URL=https://tools.example" in command
+    assert "APT_MIRROR=https://apt.example" in command
+    assert "PIP_INDEX_URL=https://pypi.example/simple" in command
     assert command[-1] == str(ROOT)
 
 

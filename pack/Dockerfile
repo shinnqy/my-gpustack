@@ -4,6 +4,8 @@
 ARG PYTHON_VERSION=3.11
 ARG GPUSTACK_BASE_IMAGE=base
 ARG GPUSTACK_OPERATOR_VERSION=v0.9.2
+ARG APT_MIRROR=https://deb.debian.org
+ARG PIP_INDEX_URL=https://pypi.org/simple
 
 # 准备 Operator 二进制的来源
 FROM gpustack/gpustack-operator:${GPUSTACK_OPERATOR_VERSION} AS gpustack-operator
@@ -12,17 +14,23 @@ FROM gpustack/gpustack-operator:${GPUSTACK_OPERATOR_VERSION} AS gpustack-operato
 FROM python:${PYTHON_VERSION}-slim-bookworm AS base
 # 指定后续 shell 形式的 RUN 使用 Bash
 SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
+ARG APT_MIRROR
 ENV PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     UV_SYSTEM_PYTHON=1 \
     UV_PYTHON_DOWNLOADS=never
 # 安装系统依赖
-RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+RUN sed -i -E "s|https?://deb.debian.org|${APT_MIRROR%/}|g" /etc/apt/sources.list.d/debian.sources \
     && apt-get -o Acquire::Retries=3 -o APT::Update::Error-Mode=any update \
     && apt-get install -y --no-install-recommends \
        bash ca-certificates curl git make pciutils libnuma1 libstdc++6 libgomp1 tini \
-    && rm -rf /var/lib/apt/lists/* \
-    && pip install uv==0.11.7
+    && rm -rf /var/lib/apt/lists/*
+
+# A Python download failure must not discard the completed system-package layer.
+ARG PIP_INDEX_URL
+RUN --mount=type=cache,target=/root/.cache \
+    PIP_NO_CACHE_DIR=0 pip install --index-url "${PIP_INDEX_URL}" \
+      --timeout 120 --retries 3 uv==0.11.7
 
 # 主阶段开始组装最终的 GPUStack 镜像
 FROM ${GPUSTACK_BASE_IMAGE} AS gpustack
@@ -31,6 +39,7 @@ ARG TARGETOS
 ARG TARGETARCH
 ARG GPUSTACK_TOOLS_DOWNLOAD_BASE_URL
 ARG GPUSTACK_RUNTIME_DOCKER_MIRRORED_NAME_FILTER_LABELS
+ARG PIP_INDEX_URL
 ENV PYTHONUNBUFFERED=1 \
     GPUSTACK_TOOLS_DOWNLOAD_BASE_URL="${GPUSTACK_TOOLS_DOWNLOAD_BASE_URL}"
 
@@ -44,6 +53,7 @@ ENV PYTHONUNBUFFERED=1 \
 RUN --mount=type=cache,target=/root/.cache \
     --mount=type=bind,target=/workspace/gpustack,rw <<EOF
     export UV_SYSTEM_PYTHON=1 UV_LINK_MODE=copy UV_NO_CACHE=0
+    export UV_DEFAULT_INDEX="${PIP_INDEX_URL}"
     cd /workspace/gpustack
     make build
     uv pip install --system dist/*.whl

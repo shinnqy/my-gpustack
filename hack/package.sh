@@ -52,7 +52,7 @@ fi
 for package_label in "${LABELS[@]}"; do
     EXTRA_ARGS+=(--label "$package_label")
 done
-for package_arg in PYTHON_VERSION GPUSTACK_BASE_IMAGE GPUSTACK_OPERATOR_VERSION GPUSTACK_TOOLS_DOWNLOAD_BASE_URL; do
+for package_arg in PYTHON_VERSION GPUSTACK_BASE_IMAGE GPUSTACK_OPERATOR_VERSION GPUSTACK_TOOLS_DOWNLOAD_BASE_URL APT_MIRROR PIP_INDEX_URL; do
     package_value="${!package_arg:-}"
     if [[ -n "$package_value" ]]; then
         EXTRA_ARGS+=(--build-arg "${package_arg}=${package_value}")
