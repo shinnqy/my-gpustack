@@ -1,0 +1,42 @@
+# Linux Server deployment; uses the same built image as Kubernetes Workers.
+services:
+  gpustack-server:
+    image: &gpustack-image "${GPUSTACK_IMAGE:-${IMAGE_REGISTRY:-docker.io}/${IMAGE_NAMESPACE:-gpustack}/gpustack:${GPUSTACK_TAG:-dev}}"
+    # The default dev image is loaded by make package, not published remotely.
+    pull_policy: never
+    container_name: gpustack-server
+    restart: unless-stopped
+    # Preserve access to a PostgreSQL server listening on the host's loopback.
+    network_mode: host
+    stop_grace_period: 30s
+    environment:
+      GPUSTACK_DATA_DIR: /var/lib/gpustack
+      GPUSTACK_API_PORT: "${GPUSTACK_API_PORT:-30080}"
+      GPUSTACK_DATABASE_URL: "${GPUSTACK_DATABASE_URL:?Set GPUSTACK_DATABASE_URL in docker-compose/.env}"
+      GPUSTACK_SERVER_EXTERNAL_URL: "${GPUSTACK_SERVER_EXTERNAL_URL:?Set GPUSTACK_SERVER_EXTERNAL_URL to a Worker-reachable URL}"
+      # This stage has no embedded Higress; the API also serves inference.
+      GPUSTACK_GATEWAY_MODE: disabled
+      # Force Server-only mode, including when reusing an older data directory.
+      GPUSTACK_ENABLE_WORKER: "false"
+      GPUSTACK_DISABLE_WORKER: "true"
+      # Generated Worker manifests use this same image unless a cluster overrides it.
+      GPUSTACK_IMAGE_NAME_OVERRIDE: *gpustack-image
+      # Omit when unset so Config can read an existing data-directory token.
+      GPUSTACK_TOKEN:
+    volumes:
+      - "${GPUSTACK_SERVER_DATA_DIR:-gpustack-data}:/var/lib/gpustack"
+      # For local-path models, also mount the model directory at the same path:
+      # - /var/lib/gpustack/models:/var/lib/gpustack/models:ro
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ['GPUSTACK_API_PORT'] + '/healthz', timeout=3).close()"
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+volumes:
+  gpustack-data: {}

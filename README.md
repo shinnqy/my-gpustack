@@ -21,6 +21,9 @@ Spread/Binpack 放置评分，以及缩容评分链。
 
 ## 安装与启动
 
+以下是源码开发方式；使用第十五章的完整运行环境时，可按后文的
+[统一镜像启动 Server](#统一镜像启动-server) 部署。
+
 需要 Python 3.10～3.12，以及可连接的 PostgreSQL 数据库。
 
 ```bash
@@ -537,15 +540,106 @@ crictl images
 多节点需在每个匹配节点导入对应架构镜像，或者显式推送到各节点可访问的镜像仓库。
 重用同一个开发标签更新代码后，需重新导入并滚动重启 Worker Pod。
 
+## 统一镜像启动 Server
+
+沿用原项目的 `docker-compose/docker-compose.server.yaml` 入口，Server 和 Worker
+使用同一个构建产物。镜像已包含 `/usr/bin/gpustack-operator`，Server 会自动启动
+`gpustack-operator wg`；容器部署不需要向宿主机复制 Operator 或修改宿主机 PATH。
+
+此 Compose 示例面向 **Linux（包括当前 Ascend 机器）**，使用 host 网络：Server 可以继续连接
+宿主机 `127.0.0.1:5432` 上的 PostgreSQL，并使用宿主机的 30080 端口提供 API。
+当前阶段仍使用外部 PostgreSQL，镜像中没有内置数据库、UI 或 Higress。
+macOS/Windows 的源码开发继续使用上文的启动方式；此 Linux 示例不依赖 Docker Desktop 的 host 网络支持。
+
+先按上一节构建并加载当前机器架构的镜像，再从仓库根目录准备配置：
+
+```bash
+cp -n docker-compose/.env.example docker-compose/.env
+```
+
+编辑 `docker-compose/.env`，填写 `GPUSTACK_DATABASE_URL` 和
+`GPUSTACK_SERVER_EXTERNAL_URL`。新安装默认使用 `gpustack-data` 数据卷；迁移已有 Server 时，
+数据库 URL 和宿主机数据目录都复用原值，以保留集群、Worker 注册信息、令牌和服务端密钥。
+如果原源码启动命令没有指定数据库 URL，本阶段的默认值是
+`postgresql://root@127.0.0.1:5432/gpustack?sslmode=disable`。
+
+当前 Ascend 环境的 `.env` 可以使用以下网络与目录设置，数据库地址按原启动参数填写：
+
+```dotenv
+GPUSTACK_SERVER_DATA_DIR=/data2/qy/scheduling/tmp/gpustack-server
+GPUSTACK_SERVER_EXTERNAL_URL=http://100.107.227.30:30080
+GPUSTACK_API_PORT=30080
+```
+
+默认镜像为 `docker.io/gpustack/gpustack:dev`，与 `make package` 的默认产物相同。
+`IMAGE_REGISTRY`、`IMAGE_NAMESPACE`、`GPUSTACK_TAG` 沿用原项目的 Compose 配置方式；
+自定义完整镜像名称时设置 `GPUSTACK_IMAGE`。Compose 使用本地镜像；使用仓库镜像时先执行
+`docker pull <完整镜像名>`。同一镜像名称也会通过 `GPUSTACK_IMAGE_NAME_OVERRIDE` 用于生成
+Worker 清单，集群自身设置的镜像覆盖值仍优先。
+
+若模型使用 `/var/lib/gpustack/models/...` 这样的本地路径，Server 的模型分析器也需要读取权重目录。
+在 Compose 的 `volumes` 中启用示例挂载：
+
+```yaml
+      - /var/lib/gpustack/models:/var/lib/gpustack/models:ro
+```
+
+这样 Server 可读取 Ascend 宿主机上的同一批模型，Worker 仍使用自己的数据目录。
+其他本地路径也按相同路径挂载；从模型仓库下载的模型不要求这项额外挂载。
+
+检查配置后，在原终端停止源码 Server，使 API 端口和数据目录交由容器 Server 使用，再启动容器：
+
+```bash
+docker compose --env-file docker-compose/.env \
+  -f docker-compose/docker-compose.server.yaml config --quiet
+
+docker compose --env-file docker-compose/.env \
+  -f docker-compose/docker-compose.server.yaml up -d
+```
+
+Compose 明确关闭内嵌 Worker；已有的 Kubernetes Worker DaemonSet 继续连接同一个 Server 地址。
+`GPUSTACK_GATEWAY_MODE=disabled` 关闭的是当前阶段尚未打包的 Higress 入口，与自动启动的
+Operator worker gateway（`gpustack-operator wg`）是两个不同组件。
+
+验证 API、Operator 二进制和实际 gateway 子进程：
+
+```bash
+docker compose --env-file docker-compose/.env \
+  -f docker-compose/docker-compose.server.yaml ps
+docker logs --tail 100 gpustack-server
+curl -fsS http://127.0.0.1:30080/healthz
+docker exec gpustack-server gpustack-operator --version
+docker top gpustack-server -eo pid,ppid,args
+```
+
+预期容器健康、API 返回 200，进程列表中出现 `gpustack-operator wg ... --bind-unix-path ...`。
+容器健康检查验证 API；gateway 进程由最后一条命令单独确认。
+当前 `k8s-a` 集群还可以检查已有 Worker 和代理：
+
+```bash
+curl -fsS http://127.0.0.1:30080/v2/workers
+curl -fsS http://127.0.0.1:30080/v2/clusters/2/proxy/api/v1/nodes
+```
+
+使用其他集群时替换 ID。仅配置了 `k8s_options.gpuInstanceOptions` 的集群才会订阅 Operator
+gateway，因此普通模型服务集群不以 “Subscribed cluster” 日志作为成功条件。
+
+重新构建同一标签后，更新 Server 容器：
+
+```bash
+docker compose --env-file docker-compose/.env \
+  -f docker-compose/docker-compose.server.yaml up -d --force-recreate
+```
+
 ## 第十五章检查点
 
-Server 仍按上文使用 PostgreSQL 启动。准备可用的 Kubernetes 集群、NFD 和对应厂商的驱动/设备运行时。
+Server 按上一节使用统一镜像和外部 PostgreSQL 启动。准备可用的 Kubernetes 集群、NFD 和对应厂商的驱动/设备运行时。
 Server 必须能访问 Worker 节点的 API 端口（默认 10150），Worker Pod 也必须能访问 Server。
 当前通过 Worker 固定端口直连，未接入 NAT 隧道。
 
-如需 Server 侧 operator 网关，在 Server 的 PATH 中提供匹配操作系统和架构的 `gpustack-operator`
-二进制，或使用包含该二进制的 Server 镜像。当前默认 operator 镜像版本为 `v0.9.2`。
-找不到二进制时，Server 跳过网关子进程和订阅，已有 Docker 功能仍可使用。
+统一镜像已包含 Server 侧 Operator 网关所需的二进制，当前默认版本为 `v0.9.2`。
+保留源码启动方式进行调试时，需要另行在 Server 的 PATH 中准备匹配操作系统和架构的
+`gpustack-operator`；找不到时，Server 会按原项目的行为跳过网关子进程和订阅。
 
 创建 Kubernetes 集群，使用 Kubernetes 节点可访问的 Server 地址：
 

@@ -2,3 +2,4 @@ __pycache__
 /build/
 /dist/
 **/third_party/bin/
+/docker-compose/.env
