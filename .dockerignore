@@ -1,0 +1,14 @@
+.git/
+.venv/
+build/
+dist/
+**/__pycache__/
+.pytest_cache/
+**/third_party/bin/
+data/
+.data/
+.cache/
+.env
+.env.*
+gpustack-k8s*.yaml
+*.image.tar

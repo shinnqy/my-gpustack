@@ -1,6 +1,7 @@
 import argparse
 from multiprocessing import freeze_support
 from gpustack.cmd import setup_start_cmd
+from gpustack.cmd.download_tools import setup_download_tools_cmd
 
 
 def main():
@@ -14,10 +15,11 @@ def main():
     )
     subparsers = parser.add_subparsers(
         help="sub-command help",
-        metavar='{start,reload-config,list-images,save-images,copy-images,load-images,reset-admin-password,version}',
+        metavar='{start,download-tools,reload-config,list-images,save-images,copy-images,load-images,reset-admin-password,version}',
     )
 
     setup_start_cmd(subparsers)
+    setup_download_tools_cmd(subparsers)
 
     args = parser.parse_args()
     if hasattr(args, "func"):

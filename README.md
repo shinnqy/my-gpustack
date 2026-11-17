@@ -47,9 +47,16 @@ Worker 每 30 秒发送心跳和设备状态，Server 每 5 秒批量写入数�
 重启 Worker 时使用相同的数据目录和注册令牌，保留原 Worker 身份并换发专属令牌。
 集群下发的配置会应用到 Worker，本机明确设置的配置优先。
 
-系统信息采集还需要按教材将 fastfetch 可执行文件放到
-`gpustack/third_party/bin/fastfetch/fastfetch`（Windows 使用 `fastfetch.exe`）。
-系统采集配置已包含在项目中；未安装该工具时仍可注册和上报 GPU，但缺少 CPU、内存等系统信息。
+系统信息采集需要 fastfetch，可沿用原项目的工具准备命令：
+
+```bash
+uv run gpustack download-tools
+```
+
+命令按当前操作系统和架构下载到 `gpustack/third_party/bin/fastfetch/fastfetch`
+（Windows 为 `fastfetch.exe`）。也支持原项目的 `--system`、`--arch`
+和 `--tools-download-base-url` 参数；当前阶段只准备已使用的 fastfetch。
+未准备工具时仍可注册和上报 GPU，但缺少 CPU、内存等系统信息。
 
 ## 第七章检查点
 
@@ -450,6 +457,77 @@ MP 端口布局为 HTTP、DP RPC、PyTorch master、VLLM_PORT、连接端口，�
 每台 Worker 的 `<data-dir>/log/serve` 保存启动日志和容器日志，Ray head 日志如 `1.container.ray-head.0.log`；
 重启时保留当前和上一轮，删除实例时清理这些日志。
 
+## 镜像构建：补齐第十五章的打包链
+
+原 GPUStack 使用同一个 `gpustack/gpustack` 镜像运行 Server 和 Worker，
+由 `gpustack start` 的参数及环境变量决定角色。本项目沿用这一结构：
+
+| 原项目入口 | 本项目对应实现 |
+|---|---|
+| `Makefile → hack/build.sh` | `make build` 构建 wheel 和源码包 |
+| `Makefile → hack/package.sh` | `make package` 调用 Buildx 构建并加载镜像 |
+| `pack/Dockerfile` 的 `base → gpustack` | 安装本项目 wheel、准备目标架构工具、复制 Operator 二进制 |
+| `pack/entrypoint.sh` | 将容器参数交给既有 `gpustack start`，用于两种角色 |
+
+这里迁入第 1～15 章已用到的依赖；原镜像中的 UI、Higress、内置 PostgreSQL 和
+S6 多服务编排尚未进入本项目。当前镜像继续使用外部 PostgreSQL。
+Docker 构建时不复制宿主机的虚拟环境、模型缓存、数据库或其他架构的 fastfetch。
+
+沿用原项目的构建参数和默认镜像名：
+
+```bash
+make build
+make package
+```
+
+默认构建 `gpustack/gpustack:dev`，并通过 `--load` 加载到当前 Docker 引擎；
+`PACKAGE_NAMESPACE`、`PACKAGE_REPOSITORY`、`PACKAGE_TAG` 可修改镜像名，
+`PACKAGE_ARCH` 支持 `amd64` 和 `arm64`。只有显式设置
+`PACKAGE_PUSH=true` 时才推送仓库。
+
+`GPUSTACK_OPERATOR_VERSION` 是镜像内 Operator 二进制的构建参数，
+可覆盖 Dockerfile 的版本；Kubernetes 中 Operator 的镜像仍由已有
+`k8s_options.operatorImage` / `GPUSTACK_OPERATOR_IMAGE` 配置控制。
+Dockerfile 和 Python 版本常量的默认值统一为本次已验证可获取的 `v0.9.2`。
+
+在本次昇腾 ARM64 实验环境，已缓存可用的 Operator `v0.9.2`。
+若它只存在于 containerd，先把缓存导入 Docker，再构建：
+
+```bash
+ctr -n k8s.io images export --platform linux/arm64 - \
+  docker.io/gpustack/gpustack-operator:v0.9.2 | docker load
+
+PACKAGE_ARCH=arm64 \
+PACKAGE_PULL=false \
+GPUSTACK_OPERATOR_VERSION=v0.9.2 \
+GPUSTACK_TOOLS_DOWNLOAD_BASE_URL=https://gpustack-1303613262.cos.ap-guangzhou.myqcloud.com \
+make package
+```
+
+`PACKAGE_PULL=false` 允许使用本地已有的基础镜像；尚未缓存的其他构建依赖仍需下载。
+默认 `base` 使用 Python 3.11，`PYTHON_VERSION` 可覆盖其版本；
+`GPUSTACK_BASE_IMAGE` 保留原项目的基础镜像覆盖能力，自定义基础镜像需具备对应
+Python、uv、make、tini 和运行依赖。
+
+构建时会检查 CLI、fastfetch 的系统信息采集和 Operator 二进制。也可检查最终产物：
+
+```bash
+docker run --rm gpustack/gpustack:dev --help
+docker run --rm --entrypoint gpustack-operator gpustack/gpustack:dev --version
+```
+
+Kubernetes 使用 containerd 时，还要把构建产物导入其 `k8s.io` 命名空间：
+
+```bash
+docker save gpustack/gpustack:dev | ctr -n k8s.io images import -
+crictl images
+```
+
+`gpustack/gpustack:dev` 是开发镜像约定，不表示远端仓库中必然存在这个标签。
+本地构建并导入后，清单中的 `imagePullPolicy: IfNotPresent` 可以直接使用它。
+多节点需在每个匹配节点导入对应架构镜像，或者显式推送到各节点可访问的镜像仓库。
+重用同一个开发标签更新代码后，需重新导入并滚动重启 Worker Pod。
+
 ## 第十五章检查点
 
 Server 仍按上文使用 PostgreSQL 启动。准备可用的 Kubernetes 集群、NFD 和对应厂商的驱动/设备运行时。
@@ -457,7 +535,7 @@ Server 必须能访问 Worker 节点的 API 端口（默认 10150），Worker Po
 当前通过 Worker 固定端口直连，未接入 NAT 隧道。
 
 如需 Server 侧 operator 网关，在 Server 的 PATH 中提供匹配操作系统和架构的 `gpustack-operator`
-二进制，或使用包含该二进制的 Server 镜像。当前默认 operator 镜像版本为 `v0.8.5`。
+二进制，或使用包含该二进制的 Server 镜像。当前默认 operator 镜像版本为 `v0.9.2`。
 找不到二进制时，Server 跳过网关子进程和订阅，已有 Docker 功能仍可使用。
 
 创建 Kubernetes 集群，使用 Kubernetes 节点可访问的 Server 地址：
@@ -468,8 +546,9 @@ curl -s -X POST http://127.0.0.1:30080/v2/clusters \
   -d '{"name":"k8s-a","provider":"Kubernetes","server_url":"http://SERVER_IP:30080","worker_config":{"image_name_override":"REGISTRY/my-gpustack:chapter15"}}'
 ```
 
-将 `image_name_override` 替换为已发布、包含本项目及 Worker 运行依赖的镜像。
-教学项目的版本号为 `0.0.0`，生成的默认 Worker 镜像标签不能直接当作已有发布镜像使用。
+将 `image_name_override` 替换为上一步构建并分发的镜像。
+如果已按默认名称构建并导入 `gpustack/gpustack:dev`，可省略该覆盖值；
+若使用自定义仓库或标签，则填入实际镜像名称。
 `k8s_options` 支持 `namespace`、`nodeSelector`、`imageCredentials`、`volumeMounts`、`operatorImage` 和 `operator.env`。
 省略挂载时默认使用宿主机 `/var/lib/gpustack`；第一项始终挂到容器的 `/var/lib/gpustack`，用于持久化模型缓存。
 可修改第一项的宿主机目录，后续挂载可使用本章定义的 hostPath、PVC 或 ConfigMap。
