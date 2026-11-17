@@ -118,7 +118,8 @@ def test_unified_image_entrypoint_preserves_worker_arguments(tmp_path):
 
 
 @pytest.mark.parametrize("push,export", [("false", "--load"), ("true", "--push")])
-def test_package_buildx_contract(tmp_path, push, export):
+@pytest.mark.parametrize("network", ["default", "host"])
+def test_package_buildx_contract(tmp_path, push, export, network):
     executable = tmp_path / "docker"
     log = tmp_path / "docker.jsonl"
     executable.write_text(
@@ -133,6 +134,7 @@ def test_package_buildx_contract(tmp_path, push, export):
              "PACKAGE_TEST_LOG": str(log), "PACKAGE_ARCH": "aarch64",
              "PACKAGE_NAMESPACE": "local", "PACKAGE_REPOSITORY": "my-gpustack",
              "PACKAGE_TAG": "chapter15", "PACKAGE_PUSH": push, "PACKAGE_PULL": "false",
+             "PACKAGE_NETWORK": network,
              "GPUSTACK_OPERATOR_VERSION": "v0.9.2", "GPUSTACK_BASE_IMAGE": "base",
              "GPUSTACK_TOOLS_DOWNLOAD_BASE_URL": "https://tools.example"},
     )
@@ -145,6 +147,11 @@ def test_package_buildx_contract(tmp_path, push, export):
     assert command[command.index("--file") + 1] == str(ROOT / "pack/Dockerfile")
     assert export in command and ("--push" if push == "false" else "--load") not in command
     assert "--pull" not in command
+    assert command[command.index("--network") + 1] == network
+    if network == "host":
+        assert command[command.index("--allow") + 1] == "network.host"
+    else:
+        assert "--allow" not in command
     assert "GPUSTACK_OPERATOR_VERSION=v0.9.2" in command
     assert "GPUSTACK_TOOLS_DOWNLOAD_BASE_URL=https://tools.example" in command
     assert command[-1] == str(ROOT)
@@ -156,3 +163,11 @@ def test_package_rejects_unsupported_architecture():
         env={**os.environ, "PACKAGE_ARCH": "s390x"},
     )
     assert result.returncode != 0 and "Unsupported PACKAGE_ARCH" in result.stderr
+
+
+def test_package_rejects_unsupported_network():
+    result = subprocess.run(
+        ["bash", str(ROOT / "hack/package.sh")], capture_output=True, text=True,
+        env={**os.environ, "PACKAGE_ARCH": "arm64", "PACKAGE_NETWORK": "invalid"},
+    )
+    assert result.returncode != 0 and "Unsupported PACKAGE_NETWORK" in result.stderr

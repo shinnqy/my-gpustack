@@ -499,12 +499,16 @@ ctr -n k8s.io images export --platform linux/arm64 - \
 
 PACKAGE_ARCH=arm64 \
 PACKAGE_PULL=false \
+PACKAGE_NETWORK=host \
 GPUSTACK_OPERATOR_VERSION=v0.9.2 \
 GPUSTACK_TOOLS_DOWNLOAD_BASE_URL=https://gpustack-1303613262.cos.ap-guangzhou.myqcloud.com \
 make package
 ```
 
 `PACKAGE_PULL=false` 允许使用本地已有的基础镜像；尚未缓存的其他构建依赖仍需下载。
+`PACKAGE_NETWORK=host` 为构建中的 `RUN` 使用宿主机网络，并声明 `network.host` entitlement，
+对应原项目的 host 构建网络方式。宿主机联网正常、构建容器 DNS 失败时可使用此选项。
+其默认值为 `default`，也支持 `none`；它不修改 Docker daemon、iptables 或部署后 Pod 的网络。
 默认 `base` 使用 Python 3.11，`PYTHON_VERSION` 可覆盖其版本；
 `GPUSTACK_BASE_IMAGE` 保留原项目的基础镜像覆盖能力，自定义基础镜像需具备对应
 Python、uv、make、tini 和运行依赖。

@@ -8,6 +8,7 @@ PACKAGE_ARCH=${PACKAGE_ARCH:-$(uname -m)}
 PACKAGE_TAG=${PACKAGE_TAG:-dev}
 PACKAGE_PUSH=${PACKAGE_PUSH:-false}
 PACKAGE_PULL=${PACKAGE_PULL:-true}
+PACKAGE_NETWORK=${PACKAGE_NETWORK:-default}
 
 case "$PACKAGE_ARCH" in
     aarch64|arm64) PACKAGE_ARCH=arm64 ;;
@@ -20,6 +21,10 @@ for package_boolean in "$PACKAGE_PUSH" "$PACKAGE_PULL"; do
         exit 1
     fi
 done
+case "$PACKAGE_NETWORK" in
+    default|host|none) ;;
+    *) printf 'Unsupported PACKAGE_NETWORK: %s; use default, host or none.\n' "$PACKAGE_NETWORK" >&2; exit 1 ;;
+esac
 
 command -v docker >/dev/null || { printf 'Docker is required for make package.\n' >&2; exit 1; }
 docker buildx version >/dev/null
@@ -32,7 +37,10 @@ LABELS=(
     "org.opencontainers.image.revision=${REVISION}"
     "org.opencontainers.image.created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
 )
-EXTRA_ARGS=()
+EXTRA_ARGS=(--network "$PACKAGE_NETWORK")
+if [[ "$PACKAGE_NETWORK" == host ]]; then
+    EXTRA_ARGS+=(--allow network.host)
+fi
 if [[ "$PACKAGE_PUSH" == true ]]; then
     EXTRA_ARGS+=(--push)
 else
@@ -51,7 +59,7 @@ for package_arg in PYTHON_VERSION GPUSTACK_BASE_IMAGE GPUSTACK_OPERATOR_VERSION 
     fi
 done
 
-printf "Building '%s' for linux/%s\n" "$TAG" "$PACKAGE_ARCH"
+printf "Building '%s' for linux/%s (network=%s)\n" "$TAG" "$PACKAGE_ARCH" "$PACKAGE_NETWORK"
 docker buildx build \
     --platform "linux/${PACKAGE_ARCH}" \
     --target gpustack \
